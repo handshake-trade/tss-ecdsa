@@ -250,7 +250,6 @@ impl ProtocolParticipant for KeygenParticipant {
         &mut self,
         rng: &mut R,
         message: &Message,
-        input: &Self::Input,
     ) -> Result<ProcessOutcome<Self::Output>> {
         info!("Processing keygen message.");
 
@@ -264,7 +263,7 @@ impl ProtocolParticipant for KeygenParticipant {
                 let broadcast_outcome = self.handle_broadcast(rng, message)?;
 
                 // Handle the broadcasted message if all parties have agreed on it
-                broadcast_outcome.convert(self, Self::handle_round_one_msg, rng, input)
+                broadcast_outcome.convert(self, Self::handle_round_one_msg, rng)
             }
             MessageType::Keygen(KeygenMessageType::R2Decommit) => {
                 self.handle_round_two_msg(message)
@@ -392,7 +391,6 @@ impl KeygenParticipant {
         &mut self,
         rng: &mut R,
         broadcast_message: BroadcastOutput,
-        _input: &(),
     ) -> Result<ProcessOutcome<<Self as ProtocolParticipant>::Output>> {
         info!("Handling round one keygen message.");
 
@@ -748,10 +746,7 @@ mod tests {
             &message.message_type(),
             &message.from(),
         );
-        Some((
-            index,
-            participant.process_message(rng, &message, &()).unwrap(),
-        ))
+        Some((index, participant.process_message(rng, &message).unwrap()))
     }
 
     #[cfg_attr(feature = "flame_it", flame)]

@@ -425,7 +425,6 @@ impl ProtocolParticipant for PresignParticipant {
         &mut self,
         rng: &mut R,
         message: &Message,
-        input: &Self::Input,
     ) -> Result<ProcessOutcome<Self::Output>> {
         info!("Processing presign message.");
 
@@ -434,23 +433,21 @@ impl ProtocolParticipant for PresignParticipant {
         }
 
         match message.message_type() {
-            MessageType::Presign(PresignMessageType::Ready) => {
-                self.handle_ready_msg(rng, message, input)
-            }
+            MessageType::Presign(PresignMessageType::Ready) => self.handle_ready_msg(rng, message),
             MessageType::Presign(PresignMessageType::RoundOneBroadcast) => {
                 let broadcast_outcome = self.handle_broadcast(rng, message)?;
 
                 // Handle the broadcasted message if all parties have agreed on it
-                broadcast_outcome.convert(self, Self::handle_round_one_broadcast_msg, rng, input)
+                broadcast_outcome.convert(self, Self::handle_round_one_broadcast_msg, rng)
             }
             MessageType::Presign(PresignMessageType::RoundOne) => {
-                self.handle_round_one_msg(rng, message, input)
+                self.handle_round_one_msg(rng, message)
             }
             MessageType::Presign(PresignMessageType::RoundTwo) => {
-                self.handle_round_two_msg(rng, message, input)
+                self.handle_round_two_msg(rng, message)
             }
             MessageType::Presign(PresignMessageType::RoundThree) => {
-                self.handle_round_three_msg(message, input)
+                self.handle_round_three_msg(message)
             }
             message_type => {
                 error!(
@@ -500,15 +497,13 @@ impl PresignParticipant {
         &mut self,
         rng: &mut R,
         message: &Message,
-        input: &Input,
     ) -> Result<ProcessOutcome<<Self as ProtocolParticipant>::Output>> {
         info!("Handling ready presign message.");
 
         let (ready_outcome, is_ready) = self.process_ready_message::<storage::Ready>(message)?;
 
         if is_ready {
-            let round_one_messages =
-                run_only_once!(self.gen_round_one_msgs(rng, message.id(), input))?;
+            let round_one_messages = run_only_once!(self.gen_round_one_msgs(rng, message.id()))?;
             Ok(ready_outcome.with_messages(round_one_messages))
         } else {
             Ok(ready_outcome)
@@ -528,12 +523,11 @@ impl PresignParticipant {
         &mut self,
         rng: &mut R,
         sid: Identifier,
-        input: &Input,
     ) -> Result<Vec<Message>> {
         info!("Generating round one presign messages.");
 
-        let info = PresignKeyShareAndInfo::new(self.id, input)?;
-        let other_public_auxinfo = input.all_but_one_auxinfo_public(self.id);
+        let info = PresignKeyShareAndInfo::new(self.id, self.input())?;
+        let other_public_auxinfo = self.input().all_but_one_auxinfo_public(self.id);
 
         // Run round one.
         let (private, r1_publics, r1_public_broadcast) =
@@ -578,7 +572,6 @@ impl PresignParticipant {
         &mut self,
         rng: &mut R,
         broadcast_message: BroadcastOutput,
-        input: &Input,
     ) -> Result<ProcessOutcome<<Self as ProtocolParticipant>::Output>> {
         info!("Presign: Handling round one broadcast message.");
 
@@ -603,7 +596,7 @@ impl PresignParticipant {
             return Err(InternalError::ProtocolError);
         }
         match retrieved_messages.get(0) {
-            Some(message) => self.handle_round_one_msg(rng, message, input),
+            Some(message) => self.handle_round_one_msg(rng, message),
             None => Ok(ProcessOutcome::Incomplete),
         }
     }
@@ -618,7 +611,6 @@ impl PresignParticipant {
         &mut self,
         rng: &mut R,
         message: &Message,
-        input: &Input,
     ) -> Result<ProcessOutcome<<Self as ProtocolParticipant>::Output>> {
         use crate::round_one::Public as RoundOnePublic;
 
@@ -642,8 +634,8 @@ impl PresignParticipant {
             .local_storage
             .retrieve::<storage::RoundOnePublicBroadcast>(message.from())?;
 
-        let info = PresignKeyShareAndInfo::new(self.id, input)?;
-        let auxinfo_public = input.find_auxinfo_public(message.from())?;
+        let info = PresignKeyShareAndInfo::new(self.id, self.input())?;
+        let auxinfo_public = self.input().find_auxinfo_public(message.from())?;
         let round_one_public = RoundOnePublic::try_from(message)?;
         round_one_public.verify(
             &self.retrieve_context(),
@@ -665,13 +657,12 @@ impl PresignParticipant {
         {
             info!("Presign: Round one complete. Generating round two messages.");
             // Finish round one by generating messages for round two.
-            let round_two_messages =
-                run_only_once!(self.gen_round_two_msgs(rng, message.id(), input))?;
+            let round_two_messages = run_only_once!(self.gen_round_two_msgs(rng, message.id()))?;
             // Process any round two messages we may have received early.
             let round_two_outcomes = self
                 .fetch_messages(MessageType::Presign(PresignMessageType::RoundTwo))?
                 .iter()
-                .map(|msg| self.handle_round_two_msg(rng, msg, input))
+                .map(|msg| self.handle_round_two_msg(rng, msg))
                 .collect::<Result<Vec<_>>>()?;
             ProcessOutcome::collect_with_messages(round_two_outcomes, round_two_messages)
         } else {
@@ -689,7 +680,6 @@ impl PresignParticipant {
         &mut self,
         rng: &mut R,
         sid: Identifier,
-        input: &Input,
     ) -> Result<Vec<Message>> {
         info!("Presign: Generating round two messages.");
 
@@ -701,11 +691,11 @@ impl PresignParticipant {
             .local_storage
             .contains::<storage::RoundOnePrivate>(self.id)
         {
-            let more_messages = run_only_once!(self.gen_round_one_msgs(rng, sid, input))?;
+            let more_messages = run_only_once!(self.gen_round_one_msgs(rng, sid))?;
             messages.extend_from_slice(&more_messages);
         }
 
-        let info = PresignKeyShareAndInfo::new(self.id, input)?;
+        let info = PresignKeyShareAndInfo::new(self.id, self.input())?;
         // We need this clone as the map below uses a mutable `self`.
         let pids = self.other_participant_ids.clone();
         let more_messages: Vec<Message> = pids
@@ -717,7 +707,7 @@ impl PresignParticipant {
                 let r1_public_broadcast = self
                     .local_storage
                     .retrieve::<storage::RoundOnePublicBroadcast>(pid)?;
-                let sender_auxinfo_public = input.find_auxinfo_public(pid)?;
+                let sender_auxinfo_public = self.input().find_auxinfo_public(pid)?;
                 let (r2_priv, r2_pub) = info.round_two(
                     rng,
                     &self.retrieve_context(),
@@ -750,7 +740,6 @@ impl PresignParticipant {
         &mut self,
         rng: &mut R,
         message: &Message,
-        input: &Input,
     ) -> Result<ProcessOutcome<<Self as ProtocolParticipant>::Output>> {
         info!("Presign: Handling round two message.");
 
@@ -765,7 +754,7 @@ impl PresignParticipant {
             return Ok(ProcessOutcome::Incomplete);
         }
 
-        self.validate_and_store_round_two_public(input, message)?;
+        self.validate_and_store_round_two_public(message)?;
 
         // Check if storage has all of the other participants' round two values
         // (both private and public), and start generating the messages for
@@ -779,13 +768,13 @@ impl PresignParticipant {
         if all_privates_received && all_publics_received {
             info!("Presign: Round two complete. Generating round three messages.");
             // Generate messages for round three...
-            let messages = run_only_once!(self.gen_round_three_msgs(rng, message.id(), input))?;
+            let messages = run_only_once!(self.gen_round_three_msgs(rng, message.id()))?;
             // ... and handle any messages that other participants have sent for round
             // three.
             let outcomes = self
                 .fetch_messages(MessageType::Presign(PresignMessageType::RoundThree))?
                 .iter()
-                .map(|msg| self.handle_round_three_msg(msg, input))
+                .map(|msg| self.handle_round_three_msg(msg))
                 .collect::<Result<Vec<_>>>()?;
             ProcessOutcome::collect_with_messages(outcomes, messages)
         } else {
@@ -806,16 +795,15 @@ impl PresignParticipant {
         &mut self,
         rng: &mut R,
         sid: Identifier,
-        input: &Input,
     ) -> Result<Vec<Message>> {
         info!("Generating round three presign messages.");
 
-        let info = PresignKeyShareAndInfo::new(self.id, input)?;
+        let info = PresignKeyShareAndInfo::new(self.id, self.input())?;
         // Collect the other participant's values from storage needed for round
         // three.
         let mut hashmap = HashMap::new();
         for pid in self.other_participant_ids.clone() {
-            let auxinfo_public = input.find_auxinfo_public(pid)?;
+            let auxinfo_public = self.input().find_auxinfo_public(pid)?;
             let r2_private = self
                 .local_storage
                 .retrieve::<storage::RoundTwoPrivate>(pid)?;
@@ -863,7 +851,6 @@ impl PresignParticipant {
     fn handle_round_three_msg(
         &mut self,
         message: &Message,
-        input: &Input,
     ) -> Result<ProcessOutcome<<Self as ProtocolParticipant>::Output>> {
         info!("Handling round three presign message.");
 
@@ -878,7 +865,7 @@ impl PresignParticipant {
             return Ok(ProcessOutcome::Incomplete);
         }
 
-        self.validate_and_store_round_three_public(input, message)?;
+        self.validate_and_store_round_three_public(message)?;
 
         // If we have round three public values from all other participants, we
         // are done with the protocol! All we have left to do is create the
@@ -939,11 +926,9 @@ impl PresignParticipant {
     }
 
     #[cfg_attr(feature = "flame_it", flame("presign"))]
-    fn validate_and_store_round_two_public(
-        &mut self,
-        input: &Input,
-        message: &Message,
-    ) -> Result<()> {
+    fn validate_and_store_round_two_public(&mut self, message: &Message) -> Result<()> {
+        let input = self.input();
+
         let receiver_auxinfo_public = input.find_auxinfo_public(message.to())?;
         let sender_auxinfo_public = input.find_auxinfo_public(message.from())?;
         let sender_keyshare_public = input.find_keyshare_public(message.from())?;
@@ -971,11 +956,8 @@ impl PresignParticipant {
     }
 
     #[cfg_attr(feature = "flame_it", flame("presign"))]
-    fn validate_and_store_round_three_public(
-        &mut self,
-        input: &Input,
-        message: &Message,
-    ) -> Result<()> {
+    fn validate_and_store_round_three_public(&mut self, message: &Message) -> Result<()> {
+        let input = self.input();
         let receiver_auxinfo_public = input.find_auxinfo_public(message.to())?;
         let sender_auxinfo_public = input.find_auxinfo_public(message.from())?;
         let sender_r1_public_broadcast = self

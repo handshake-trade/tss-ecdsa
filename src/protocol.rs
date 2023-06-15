@@ -190,9 +190,7 @@ impl<P: ProtocolParticipant> Participant<P> {
         }
 
         // Handle it!
-        let outcome =
-            self.participant
-                .process_message(rng, message, &self.participant.input().clone())?;
+        let outcome = self.participant.process_message(rng, message)?;
         let (output, messages) = outcome.into_parts();
         Ok((output, messages))
     }

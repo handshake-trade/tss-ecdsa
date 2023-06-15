@@ -198,7 +198,6 @@ impl ProtocolParticipant for AuxInfoParticipant {
         &mut self,
         rng: &mut R,
         message: &Message,
-        input: &Self::Input,
     ) -> Result<ProcessOutcome<Self::Output>> {
         info!("Processing auxinfo message.");
 
@@ -212,7 +211,7 @@ impl ProtocolParticipant for AuxInfoParticipant {
                 let broadcast_outcome = self.handle_broadcast(rng, message)?;
 
                 // Handle the broadcasted message if all parties have agreed on it
-                broadcast_outcome.convert(self, Self::handle_round_one_msg, rng, input)
+                broadcast_outcome.convert(self, Self::handle_round_one_msg, rng)
             }
             MessageType::Auxinfo(AuxinfoMessageType::R2Decommit) => {
                 self.handle_round_two_msg(rng, message)
@@ -333,7 +332,6 @@ impl AuxInfoParticipant {
         &mut self,
         rng: &mut R,
         broadcast_message: BroadcastOutput,
-        _input: &(),
     ) -> Result<ProcessOutcome<<Self as ProtocolParticipant>::Output>> {
         info!("Handling round one auxinfo message.");
 
@@ -720,10 +718,7 @@ mod tests {
             &message.message_type(),
             &message.from(),
         );
-        Some((
-            index,
-            participant.process_message(rng, &message, &()).unwrap(),
-        ))
+        Some((index, participant.process_message(rng, &message).unwrap()))
     }
 
     #[cfg_attr(feature = "flame_it", flame)]

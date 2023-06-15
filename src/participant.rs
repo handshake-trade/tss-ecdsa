@@ -84,16 +84,15 @@ where
         participant: &mut P,
         mut handle_output: F,
         rng: &mut R,
-        storage: &P::Input,
     ) -> Result<ProcessOutcome<P::Output>>
     where
         P: InnerProtocolParticipant,
-        F: FnMut(&mut P, &mut R, O, &P::Input) -> Result<ProcessOutcome<P::Output>>,
+        F: FnMut(&mut P, &mut R, O) -> Result<ProcessOutcome<P::Output>>,
         R: CryptoRng + RngCore,
     {
         let (output, messages) = self.into_parts();
         let outcome = match output {
-            Some(o) => handle_output(participant, rng, o, storage)?,
+            Some(o) => handle_output(participant, rng, o)?,
             None => ProcessOutcome::Incomplete,
         };
         Ok(outcome.with_messages(messages))
@@ -241,7 +240,6 @@ pub trait ProtocolParticipant {
         &mut self,
         rng: &mut R,
         message: &Message,
-        input: &Self::Input,
     ) -> Result<ProcessOutcome<Self::Output>>;
 
     /// The status of the protocol execution.
@@ -413,7 +411,7 @@ pub(crate) trait Broadcast {
 
         let outcome = self
             .broadcast_participant()
-            .process_message(rng, &broadcast_input, &())?;
+            .process_message(rng, &broadcast_input)?;
 
         // ...and then re-wrap the output messages.
         let (output, mut messages) = outcome.into_parts();

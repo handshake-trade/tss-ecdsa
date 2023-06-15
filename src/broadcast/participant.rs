@@ -153,7 +153,6 @@ impl ProtocolParticipant for BroadcastParticipant {
         &mut self,
         rng: &mut R,
         message: &Message,
-        _: &Self::Input,
     ) -> Result<ProcessOutcome<Self::Output>> {
         info!("Processing broadcast message.");
 
