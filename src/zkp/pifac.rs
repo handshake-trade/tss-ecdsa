@@ -6,7 +6,16 @@
 // License, Version 2.0 found in the LICENSE-APACHE file in the root directory
 // of this source tree.
 
-//! Implements the ZKP from Figure 28 of <https://eprint.iacr.org/2021/060.pdf>
+//! Implements a zero-knowledge proof that the modulus `N` can be factored into
+//! two numbers greater than `2^ℓ`, where `ℓ` is a fixed parameter defined by
+//! [`parameters::ELL`](crate::parameters::ELL).
+//!
+//! The proof is defined in Figure 28 of CGGMP[^cite], and uses a standard
+//! Fiat-Shamir transformation to make the proof non-interactive.
+//!
+//! [^cite]: Ran Canetti, Rosario Gennaro, Steven Goldfeder, Nikolaos Makriyannis, and Udi Peled.
+//! UC Non-Interactive, Proactive, Threshold ECDSA with Identifiable Aborts.
+//! [EPrint archive, 2021](https://eprint.iacr.org/2021/060.pdf).
 
 use crate::{
     errors::*,
@@ -24,43 +33,68 @@ use std::fmt::Debug;
 use tracing::error;
 use zeroize::ZeroizeOnDrop;
 
+/// Proof that the modulus `N` can be factored into two numbers greater than
+/// `2^ℓ` for a parameter `ℓ`.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub(crate) struct PiFacProof {
-    P: Commitment,
-    Q: Commitment,
-    A: Commitment,
-    B: Commitment,
-    T: Commitment,
-    sigma: CommitmentRandomness,
-    z1: BigNumber,
-    z2: BigNumber,
-    w1: MaskedRandomness,
-    w2: MaskedRandomness,
-    v: MaskedRandomness,
+    /// Commitment to the factor `p` (`P` in the paper).
+    p_commitment: Commitment,
+    /// Commitment to the factor `q` (`Q` in the paper).
+    q_commitment: Commitment,
+    /// Commitment to a mask for p (`A` in the paper).
+    p_mask_commitment: Commitment,
+    /// Commitment to a mask for q (`B` in the paper).
+    q_mask_commitment: Commitment,
+    /// Commitment linking `q` to the commitment randomness used in
+    /// `p_commitment`.
+    q_link_commitment: Commitment,
+    /// Randomness linking `q` to `p_commitment`.
+    link_randomness: CommitmentRandomness,
+    /// Mask `p` (`z1` in the paper`).
+    p_masked: BigNumber,
+    /// Mask `q` (`z2` in the paper).
+    q_masked: BigNumber,
+    /// Masked commitment randomness used to form `p_commitment` (`w1` in the
+    /// paper).
+    masked_p_commitment_randomness: MaskedRandomness,
+    /// Masked commitment randomness used to form `q_commitment` (`w2` in the
+    /// paper).
+    masked_q_commitment_randomness: MaskedRandomness,
+    /// Masked commitment randomness linking `p` to the commitment randomness
+    /// used in `q_commitment` (`v` in the paper).
+    masked_p_link: MaskedRandomness,
 }
 
+/// Common input and setup parameters known to both the prover and verifier.
 #[derive(Serialize)]
-pub(crate) struct PiFacInput {
+pub(crate) struct CommonInput {
     setup_params: VerifiedRingPedersen,
-    N0: BigNumber,
+    modulus: BigNumber,
 }
 
-impl PiFacInput {
-    pub(crate) fn new(setup_params: &VerifiedRingPedersen, N0: &BigNumber) -> Self {
+impl CommonInput {
+    /// Generate public input for proving and verifying [`PiFacProof`] about
+    /// `N`.
+    pub(crate) fn new(
+        verifier_commitment_params: &VerifiedRingPedersen,
+        prover_modulus: &BigNumber,
+    ) -> Self {
         Self {
-            setup_params: setup_params.clone(),
-            N0: N0.clone(),
+            setup_params: verifier_commitment_params.clone(),
+            modulus: prover_modulus.clone(),
         }
     }
 }
 
+/// The prover's secret knowledge: the factors `p` and `q` of the modulus `N`
+/// where `N = pq`.
 #[derive(ZeroizeOnDrop)]
-pub(crate) struct PiFacSecret {
+pub(crate) struct ProverSecret {
     p: BigNumber,
     q: BigNumber,
 }
 
-impl Debug for PiFacSecret {
+impl Debug for ProverSecret {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("pifac::Secret")
             .field("p", &"[redacted]")
@@ -69,7 +103,7 @@ impl Debug for PiFacSecret {
     }
 }
 
-impl PiFacSecret {
+impl ProverSecret {
     pub(crate) fn new(p: &BigNumber, q: &BigNumber) -> Self {
         Self {
             p: p.clone(),
@@ -79,8 +113,8 @@ impl PiFacSecret {
 }
 
 impl Proof for PiFacProof {
-    type CommonInput = PiFacInput;
-    type ProverSecret = PiFacSecret;
+    type CommonInput = CommonInput;
+    type ProverSecret = ProverSecret;
     #[cfg_attr(feature = "flame_it", flame("PiFacProof"))]
     fn prove<R: RngCore + CryptoRng>(
         input: &Self::CommonInput,
@@ -90,58 +124,71 @@ impl Proof for PiFacProof {
         rng: &mut R,
     ) -> Result<Self> {
         // Small names for scaling factors in our ranges
-        let sqrt_N0 = &sqrt(&input.N0);
+        let sqrt_N0 = &sqrt(&input.modulus);
 
-        let alpha = random_plusminus_scaled(rng, ELL + EPSILON, sqrt_N0);
-        let beta = random_plusminus_scaled(rng, ELL + EPSILON, sqrt_N0);
+        let p_mask = random_plusminus_scaled(rng, ELL + EPSILON, sqrt_N0); // `alpha` in the paper
+        let q_mask = random_plusminus_scaled(rng, ELL + EPSILON, sqrt_N0); // `beta` in the paper
 
-        let sigma = input
-            .setup_params
-            .scheme()
-            .commitment_randomness(ELL, &input.N0, rng);
+        let link_randomness =
+            input
+                .setup_params
+                .scheme()
+                .commitment_randomness(ELL, &input.modulus, rng);
 
-        let (P, mu) = input.setup_params.scheme().commit(&secret.p, ELL, rng);
-        let (Q, nu) = input.setup_params.scheme().commit(&secret.q, ELL, rng);
-        let (A, x) = input
-            .setup_params
-            .scheme()
-            .commit(&alpha, ELL + EPSILON, rng);
-        let (B, y) = input
-            .setup_params
-            .scheme()
-            .commit(&beta, ELL + EPSILON, rng);
-        let (T, r) = input.setup_params.scheme().commit_with_commitment(
-            &Q,
-            &alpha,
+        let (p_commitment, mu) = input.setup_params.scheme().commit(&secret.p, ELL, rng);
+        let (q_commitment, nu) = input.setup_params.scheme().commit(&secret.q, ELL, rng);
+        let (p_mask_commitment, x) =
+            input
+                .setup_params
+                .scheme()
+                .commit(&p_mask, ELL + EPSILON, rng);
+        let (q_mask_commitment, y) =
+            input
+                .setup_params
+                .scheme()
+                .commit(&q_mask, ELL + EPSILON, rng);
+        let (q_link_commitment, r) = input.setup_params.scheme().commit_with_commitment(
+            &q_commitment,
+            &p_mask,
             ELL + EPSILON,
-            &input.N0,
+            &input.modulus,
             rng,
         );
 
-        Self::fill_transcript(transcript, context, input, &P, &Q, &A, &B, &T, &sigma)?;
+        Self::fill_transcript(
+            transcript,
+            context,
+            input,
+            &p_commitment,
+            &q_commitment,
+            &p_mask_commitment,
+            &q_mask_commitment,
+            &q_link_commitment,
+            &link_randomness,
+        )?;
 
         // Verifier samples e in +- q (where q is the group order)
         let e = plusminus_challenge_from_transcript(transcript)?;
 
-        let sigma_hat = nu.mask_neg(&sigma, &secret.p);
-        let z1 = &alpha + &e * &secret.p;
-        let z2 = &beta + &e * &secret.q;
-        let w1 = mu.mask(&x, &e);
-        let w2 = nu.mask(&y, &e);
-        let v = sigma_hat.remask(&r, &e);
+        let sigma_hat = nu.mask_neg(&link_randomness, &secret.p);
+        let p_masked = &p_mask + &e * &secret.p;
+        let q_masked = &q_mask + &e * &secret.q;
+        let masked_p_commitment_randomness = mu.mask(&x, &e);
+        let masked_q_commitment_randomness = nu.mask(&y, &e);
+        let masked_p_link = sigma_hat.remask(&r, &e);
 
         let proof = Self {
-            P,
-            Q,
-            A,
-            B,
-            T,
-            sigma,
-            z1,
-            z2,
-            w1,
-            w2,
-            v,
+            p_commitment,
+            q_commitment,
+            p_mask_commitment,
+            q_mask_commitment,
+            q_link_commitment,
+            link_randomness,
+            p_masked,
+            q_masked,
+            masked_p_commitment_randomness,
+            masked_q_commitment_randomness,
+            masked_p_link,
         };
         Ok(proof)
     }
@@ -156,68 +203,86 @@ impl Proof for PiFacProof {
             transcript,
             context,
             input,
-            &self.P,
-            &self.Q,
-            &self.A,
-            &self.B,
-            &self.T,
-            &self.sigma,
+            &self.p_commitment,
+            &self.q_commitment,
+            &self.p_mask_commitment,
+            &self.q_mask_commitment,
+            &self.q_link_commitment,
+            &self.link_randomness,
         )?;
 
         // Verifier samples e in +- q (where q is the group order)
         let e = plusminus_challenge_from_transcript(transcript)?;
 
-        let eq_check_1 = {
-            let lhs = input.setup_params.scheme().reconstruct(&self.z1, &self.w1);
-            let rhs = input.setup_params.scheme().combine(&self.A, &self.P, &e);
-            lhs == rhs
-        };
-        if !eq_check_1 {
-            error!("eq_check_1 failed");
-            return Err(InternalError::ProtocolError);
-        }
-
-        let eq_check_2 = {
-            let lhs = input.setup_params.scheme().reconstruct(&self.z2, &self.w2);
-            let rhs = input.setup_params.scheme().combine(&self.B, &self.Q, &e);
-            lhs == rhs
-        };
-        if !eq_check_2 {
-            error!("eq_check_2 failed");
-            return Err(InternalError::ProtocolError);
-        }
-
-        let eq_check_3 = {
-            let R = input
-                .setup_params
-                .scheme()
-                .reconstruct(&input.N0, self.sigma.as_masked());
+        let masked_p_commitment_is_valid = {
             let lhs = input
                 .setup_params
                 .scheme()
-                .reconstruct_with_commitment(&self.Q, &self.z1, &self.v);
-            let rhs = input.setup_params.scheme().combine(&self.T, &R, &e);
+                .reconstruct(&self.p_masked, &self.masked_p_commitment_randomness);
+            let rhs = input.setup_params.scheme().combine(
+                &self.p_mask_commitment,
+                &self.p_commitment,
+                &e,
+            );
             lhs == rhs
         };
-        if !eq_check_3 {
-            error!("eq_check_3 failed");
+        if !masked_p_commitment_is_valid {
+            error!("masked_p_commitment_is_valid failed");
             return Err(InternalError::ProtocolError);
         }
 
-        let sqrt_N0 = sqrt(&input.N0);
+        let masked_q_commitment_is_valid = {
+            let lhs = input
+                .setup_params
+                .scheme()
+                .reconstruct(&self.q_masked, &self.masked_q_commitment_randomness);
+            let rhs = input.setup_params.scheme().combine(
+                &self.q_mask_commitment,
+                &self.q_commitment,
+                &e,
+            );
+            lhs == rhs
+        };
+        if !masked_q_commitment_is_valid {
+            error!("masked_q_commitment_is_valid failed");
+            return Err(InternalError::ProtocolError);
+        }
+
+        let modulus_links_provided_factors = {
+            let reconstructed_commitment = input
+                .setup_params
+                .scheme()
+                .reconstruct(&input.modulus, self.link_randomness.as_masked());
+            let lhs = input.setup_params.scheme().reconstruct_with_commitment(
+                &self.q_commitment,
+                &self.p_masked,
+                &self.masked_p_link,
+            );
+            let rhs = input.setup_params.scheme().combine(
+                &self.q_link_commitment,
+                &reconstructed_commitment,
+                &e,
+            );
+            lhs == rhs
+        };
+        if !modulus_links_provided_factors {
+            error!("modulus_links_provided_factors failed");
+            return Err(InternalError::ProtocolError);
+        }
+
+        let sqrt_modulus = sqrt(&input.modulus);
         // 2^{ELL + EPSILON}
         let two_ell_eps = BigNumber::one() << (ELL + EPSILON);
         // 2^{ELL + EPSILON} * sqrt(N_0)
-        let z_bound = &sqrt_N0 * &two_ell_eps;
-        if self.z1 < -z_bound.clone() || self.z1 > z_bound {
-            error!("self.z1 > z_bound check failed");
+        let z_bound = &sqrt_modulus * &two_ell_eps;
+        if self.p_masked < -z_bound.clone() || self.p_masked > z_bound {
+            error!("p is out of range!");
             return Err(InternalError::ProtocolError);
         }
-        if self.z2 < -z_bound.clone() || self.z2 > z_bound {
-            error!("self.z2 > z_bound check failed");
+        if self.q_masked < -z_bound.clone() || self.q_masked > z_bound {
+            error!("q is out of range!");
             return Err(InternalError::ProtocolError);
         }
-
         Ok(())
     }
 }
@@ -227,7 +292,7 @@ impl PiFacProof {
     fn fill_transcript(
         transcript: &mut Transcript,
         context: &impl ProofContext,
-        input: &PiFacInput,
+        input: &CommonInput,
         P: &Commitment,
         Q: &Commitment,
         A: &Commitment,
@@ -269,16 +334,16 @@ mod tests {
 
     fn random_no_small_factors_proof<R: RngCore + CryptoRng>(
         rng: &mut R,
-    ) -> Result<(PiFacInput, PiFacProof)> {
+    ) -> Result<(CommonInput, PiFacProof)> {
         let (p0, q0) = prime_gen::get_prime_pair_from_pool_insecure(rng).unwrap();
         let N0 = &p0 * &q0;
         let setup_params = VerifiedRingPedersen::gen(rng, &())?;
 
         let mut transcript = Transcript::new(b"PiFac Test");
-        let input = PiFacInput::new(&setup_params, &N0);
+        let input = CommonInput::new(&setup_params, &N0);
         let proof = PiFacProof::prove(
             &input,
-            &PiFacSecret::new(&p0, &q0),
+            &ProverSecret::new(&p0, &q0),
             &(),
             &mut transcript,
             rng,
@@ -314,7 +379,7 @@ mod tests {
         let (input, proof) = random_no_small_factors_proof(&mut rng)?;
 
         {
-            let incorrect_N = PiFacInput::new(
+            let incorrect_N = CommonInput::new(
                 &input.setup_params,
                 &prime_gen::try_get_prime_from_pool_insecure(&mut rng).unwrap(),
             );
@@ -323,7 +388,7 @@ mod tests {
         }
         {
             let incorrect_startup_params =
-                PiFacInput::new(&VerifiedRingPedersen::gen(&mut rng, &())?, &input.N0);
+                CommonInput::new(&VerifiedRingPedersen::gen(&mut rng, &())?, &input.modulus);
             let mut transcript = Transcript::new(b"PiFac Test");
             assert!(proof
                 .verify(&incorrect_startup_params, &(), &mut transcript)
@@ -334,7 +399,7 @@ mod tests {
             let (not_p0, not_q0) = prime_gen::get_prime_pair_from_pool_insecure(&mut rng).unwrap();
             let incorrect_factors = PiFacProof::prove(
                 &input,
-                &PiFacSecret::new(&not_p0, &not_q0),
+                &ProverSecret::new(&not_p0, &not_q0),
                 &(),
                 &mut transcript,
                 &mut rng,
@@ -348,10 +413,10 @@ mod tests {
             let small_p = BigNumber::from(7u64);
             let small_q = BigNumber::from(11u64);
             let setup_params = VerifiedRingPedersen::gen(&mut rng, &())?;
-            let small_input = PiFacInput::new(&setup_params, &(&small_p * &small_q));
+            let small_input = CommonInput::new(&setup_params, &(&small_p * &small_q));
             let small_proof = PiFacProof::prove(
                 &input,
-                &PiFacSecret::new(&small_p, &small_q),
+                &ProverSecret::new(&small_p, &small_q),
                 &(),
                 &mut transcript,
                 &mut rng,
@@ -363,10 +428,10 @@ mod tests {
 
             let mut transcript = Transcript::new(b"PiFac Test");
             let regular_sized_q = prime_gen::try_get_prime_from_pool_insecure(&mut rng).unwrap();
-            let mixed_input = PiFacInput::new(&setup_params, &(&small_p * &regular_sized_q));
+            let mixed_input = CommonInput::new(&setup_params, &(&small_p * &regular_sized_q));
             let mixed_proof = PiFacProof::prove(
                 &input,
-                &PiFacSecret::new(&small_p, &regular_sized_q),
+                &ProverSecret::new(&small_p, &regular_sized_q),
                 &(),
                 &mut transcript,
                 &mut rng,
@@ -379,10 +444,10 @@ mod tests {
             let mut transcript = Transcript::new(b"PiFac Test");
             let small_fac_p = &not_p0 * &BigNumber::from(2u64);
             let small_fac_input =
-                PiFacInput::new(&setup_params, &(&small_fac_p * &regular_sized_q));
+                CommonInput::new(&setup_params, &(&small_fac_p * &regular_sized_q));
             let small_fac_proof = PiFacProof::prove(
                 &input,
-                &PiFacSecret::new(&small_fac_p, &regular_sized_q),
+                &ProverSecret::new(&small_fac_p, &regular_sized_q),
                 &(),
                 &mut transcript,
                 &mut rng,
