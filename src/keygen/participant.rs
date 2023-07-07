@@ -129,6 +129,8 @@ pub struct KeygenParticipant {
     broadcast_participant: BroadcastParticipant,
     /// Status of the protocol execution.
     status: Status,
+    /// Whether or not the participant is Ready
+    ready: bool,
 }
 
 /// Output type from key generation, including all parties' public key shares,
@@ -217,6 +219,7 @@ impl ProtocolParticipant for KeygenParticipant {
                 input,
             )?,
             status: Status::Initialized,
+            ready: false,
         })
     }
 
@@ -251,10 +254,20 @@ impl ProtocolParticipant for KeygenParticipant {
         rng: &mut R,
         message: &Message,
     ) -> Result<ProcessOutcome<Self::Output>> {
-        info!("Processing keygen message.");
+        info!(
+            "KEYGEN: Player {}: received {:?} from {}",
+            self.id(),
+            message.message_type(),
+            message.from()
+        );
 
         if *self.status() == Status::TerminatedSuccessfully {
             Err(CallerError::ProtocolAlreadyTerminated)?;
+        }
+
+        if !self.is_ready() && message.message_type() != Self::ready_type() {
+            self.stash_message(message)?;
+            return Ok(ProcessOutcome::Incomplete);
         }
 
         match message.message_type() {
@@ -282,6 +295,10 @@ impl ProtocolParticipant for KeygenParticipant {
     fn status(&self) -> &Self::Status {
         &self.status
     }
+
+    fn is_ready(&self) -> bool {
+        self.ready
+    }
 }
 
 impl InnerProtocolParticipant for KeygenParticipant {
@@ -297,6 +314,10 @@ impl InnerProtocolParticipant for KeygenParticipant {
 
     fn local_storage_mut(&mut self) -> &mut LocalStorage {
         &mut self.local_storage
+    }
+
+    fn set_ready(&mut self) {
+        self.ready = true;
     }
 }
 
@@ -320,14 +341,10 @@ impl KeygenParticipant {
     ) -> Result<ProcessOutcome<<Self as ProtocolParticipant>::Output>> {
         info!("Handling ready keygen message.");
 
-        let (ready_outcome, is_ready) = self.process_ready_message::<storage::Ready>(message)?;
-
-        if is_ready {
-            let round_one_messages = run_only_once!(self.gen_round_one_msgs(rng, message.id()))?;
-            Ok(ready_outcome.with_messages(round_one_messages))
-        } else {
-            Ok(ready_outcome)
-        }
+        let ready_outcome = self.process_ready_message(rng, message)?;
+        let round_one_messages = run_only_once!(self.gen_round_one_msgs(rng, message.id()))?;
+        // extend the output with r1 messages (if they hadn't already been generated)
+        Ok(ready_outcome.with_messages(round_one_messages))
     }
 
     /// Generate the protocol's round one message.
@@ -746,8 +763,7 @@ mod tests {
     // likelihood
     fn keygen_always_produces_valid_outputs() -> Result<()> {
         let _rng = init_testing();
-
-        for _ in 0..20 {
+        for _ in 0..30 {
             keygen_produces_valid_outputs()?;
         }
         Ok(())

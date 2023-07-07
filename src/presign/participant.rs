@@ -227,6 +227,8 @@ pub struct PresignParticipant {
     broadcast_participant: BroadcastParticipant,
     /// Status of the protocol execution.
     status: Status,
+    /// Whether or not the participant is Ready
+    ready: bool,
 }
 
 /// Input needed for [`PresignParticipant`] to run.
@@ -389,6 +391,7 @@ impl ProtocolParticipant for PresignParticipant {
             local_storage: Default::default(),
             broadcast_participant: BroadcastParticipant::new(sid, id, other_participant_ids, ())?,
             status: Status::Initialized,
+            ready: false,
         })
     }
 
@@ -432,6 +435,11 @@ impl ProtocolParticipant for PresignParticipant {
             Err(CallerError::ProtocolAlreadyTerminated)?;
         }
 
+        if !self.is_ready() && message.message_type() != Self::ready_type() {
+            self.stash_message(message)?;
+            return Ok(ProcessOutcome::Incomplete);
+        }
+
         match message.message_type() {
             MessageType::Presign(PresignMessageType::Ready) => self.handle_ready_msg(rng, message),
             MessageType::Presign(PresignMessageType::RoundOneBroadcast) => {
@@ -462,6 +470,10 @@ impl ProtocolParticipant for PresignParticipant {
     fn status(&self) -> &Self::Status {
         &self.status
     }
+
+    fn is_ready(&self) -> bool {
+        self.ready
+    }
 }
 
 impl InnerProtocolParticipant for PresignParticipant {
@@ -477,6 +489,10 @@ impl InnerProtocolParticipant for PresignParticipant {
 
     fn local_storage_mut(&mut self) -> &mut LocalStorage {
         &mut self.local_storage
+    }
+
+    fn set_ready(&mut self) {
+        self.ready = true;
     }
 }
 
@@ -500,14 +516,10 @@ impl PresignParticipant {
     ) -> Result<ProcessOutcome<<Self as ProtocolParticipant>::Output>> {
         info!("Handling ready presign message.");
 
-        let (ready_outcome, is_ready) = self.process_ready_message::<storage::Ready>(message)?;
-
-        if is_ready {
-            let round_one_messages = run_only_once!(self.gen_round_one_msgs(rng, message.id()))?;
-            Ok(ready_outcome.with_messages(round_one_messages))
-        } else {
-            Ok(ready_outcome)
-        }
+        let ready_outcome = self.process_ready_message(rng, message)?;
+        let round_one_messages = run_only_once!(self.gen_round_one_msgs(rng, message.id()))?;
+        // extend the output with r1 messages (if they hadn't already been generated)
+        Ok(ready_outcome.with_messages(round_one_messages))
     }
 
     /// Generate this participant's round one messages.
