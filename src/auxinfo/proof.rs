@@ -12,13 +12,11 @@ use crate::{
     messages::{AuxinfoMessageType, Message, MessageType},
     participant::InnerProtocolParticipant,
     ring_pedersen::VerifiedRingPedersen,
-    zkp::{
-        pifac::{CommonInput, PiFacProof, ProverSecret},
-        pimod::{PiModInput, PiModProof, PiModSecret},
-        Proof, ProofContext,
-    },
     Identifier,
 };
+
+use crate::zkp::{pifac, pimod, Proof, ProofContext};
+
 use libpaillier::unknown_order::BigNumber;
 use merlin::Transcript;
 use rand::{CryptoRng, RngCore};
@@ -29,8 +27,8 @@ use serde::{Deserialize, Serialize};
 /// This type includes proofs for `𝚷[fac]` and `𝚷[mod]`.
 #[derive(Serialize, Deserialize, Clone)]
 pub(crate) struct AuxInfoProof {
-    pimod: PiModProof,
-    pifac: PiFacProof,
+    pimod: pimod::PiModProof,
+    pifac: pifac::PiFacProof,
 }
 
 impl AuxInfoProof {
@@ -68,17 +66,17 @@ impl AuxInfoProof {
     ) -> Result<Self> {
         let mut transcript = Self::new_transcript();
         Self::append_pimod_transcript(&mut transcript, context, sid, rho)?;
-        let pimod = PiModProof::prove(
-            &PiModInput::new(N),
-            &PiModSecret::new(p, q),
+        let pimod = pimod::PiModProof::prove(
+            &pimod::CommonInput::new(N),
+            &pimod::ProverSecret::new(p, q),
             context,
             &mut transcript,
             rng,
         )?;
         Self::append_pifac_transcript(&mut transcript, context, sid, rho)?;
-        let pifac = PiFacProof::prove(
-            &CommonInput::new(verifier_params, N),
-            &ProverSecret::new(p, q),
+        let pifac = pifac::PiFacProof::prove(
+            &pifac::CommonInput::new(verifier_params, N),
+            &pifac::ProverSecret::new(p, q),
             context,
             &mut transcript,
             rng,
@@ -104,10 +102,10 @@ impl AuxInfoProof {
         let mut transcript = Self::new_transcript();
         Self::append_pimod_transcript(&mut transcript, context, sid, rho)?;
         self.pimod
-            .verify(&PiModInput::new(N), context, &mut transcript)?;
+            .verify(&pimod::CommonInput::new(N), context, &mut transcript)?;
         Self::append_pifac_transcript(&mut transcript, context, sid, rho)?;
         self.pifac.verify(
-            &CommonInput::new(verifier_params, N),
+            &pifac::CommonInput::new(verifier_params, N),
             context,
             &mut transcript,
         )?;
