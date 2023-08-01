@@ -45,7 +45,7 @@ use utils::CurvePoint;
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct PiSchProof {
     /// Commitment to the secret (`A` in the paper).
-    pub(crate) commitment: CurvePoint,
+    commitment: CurvePoint,
     /// Fiat-Shamir challenge (`e` in the paper).
     challenge: BigNumber,
     /// Response binding the commitment randomness used in the commitment (`z`
@@ -72,7 +72,7 @@ pub(crate) struct PiSchPrecommit {
 /// implement Clone and Copy for this type.
 #[derive(Serialize, Copy, Clone)]
 pub(crate) struct CommonInput<'a> {
-    X: &'a CurvePoint,
+    x_commitment: &'a CurvePoint,
 }
 
 impl PiSchPrecommit {
@@ -82,16 +82,15 @@ impl PiSchPrecommit {
 }
 
 impl<'a> CommonInput<'a> {
-    pub(crate) fn new<X>(X: &'a X) -> CommonInput<'a>
-    where
-        X: AsRef<CurvePoint> + 'a,
-    {
-        Self { X: X.as_ref() }
+    pub(crate) fn new(x_commitment: &'a impl AsRef<CurvePoint>) -> CommonInput<'a> {
+        Self {
+            x_commitment: x_commitment.as_ref(),
+        }
     }
 }
 
 pub(crate) struct ProverSecret<'a> {
-    x: &'a BigNumber,
+    discrete_logarithm: &'a BigNumber,
 }
 
 impl<'a> Debug for ProverSecret<'a> {
@@ -104,7 +103,9 @@ impl<'a> Debug for ProverSecret<'a> {
 
 impl<'a> ProverSecret<'a> {
     pub(crate) fn new(x: &'a BigNumber) -> ProverSecret<'a> {
-        Self { x }
+        Self {
+            discrete_logarithm: x,
+        }
     }
 }
 
@@ -145,12 +146,11 @@ impl Proof2 for PiSchProof {
 
         let response_matches_commitment = {
             let lhs = CurvePoint::GENERATOR.multiply_by_scalar(&self.response)?;
-            let rhs =
-                CurvePoint(self.commitment.0 + input.X.0 * utils::bn_to_scalar(&self.challenge)?);
+            let rhs = self.commitment + input.x_commitment.multiply_by_scalar(&self.challenge)?;
             lhs == rhs
         };
         if !response_matches_commitment {
-            error!("eq_check_1 failed");
+            error!("verification equation checked failed");
             return Err(InternalError::ProtocolError);
         }
 
@@ -188,7 +188,10 @@ impl PiSchProof {
         let challenge = positive_challenge_from_transcript(&mut local_transcript, &k256_order())?;
 
         // Create a response by masking the secret with the challenge and mask
-        let response = &com.randomness_for_commitment + &challenge * secret.x;
+        let response = com.randomness_for_commitment.modadd(
+            &challenge.modmul(secret.discrete_logarithm, &k256_order()),
+            &k256_order(),
+        );
 
         // Proof consists of all 3 messages in the 3 rounds
         let proof = Self {
@@ -200,18 +203,24 @@ impl PiSchProof {
     }
     pub(crate) fn from_message(message: &Message) -> Result<Self> {
         message.check_type(MessageType::Keygen(KeygenMessageType::R3Proof))?;
-        let keygen_decommit: PiSchProof = deserialize!(&message.unverified_bytes)?;
-        Ok(keygen_decommit)
+        let pisch_proof: PiSchProof = deserialize!(&message.unverified_bytes)?;
+        if pisch_proof.challenge >= k256_order() {
+            return Err(InternalError::ProtocolError);
+        }
+        if pisch_proof.response >= k256_order() {
+            return Err(InternalError::ProtocolError);
+        }
+        Ok(pisch_proof)
     }
     fn fill_transcript(
         transcript: &mut Transcript,
         context: &impl ProofContext,
         input: &CommonInput,
-        A: &CurvePoint,
+        commitment: &CurvePoint,
     ) -> Result<()> {
         transcript.append_message(b"PiSch ProofContext", &context.as_bytes()?);
         transcript.append_message(b"PiSch CommonInput", &serialize!(&input)?);
-        transcript.append_message(b"A", &serialize!(A)?);
+        transcript.append_message(b"PiSch Commitment", &serialize!(commitment)?);
         Ok(())
     }
 }
