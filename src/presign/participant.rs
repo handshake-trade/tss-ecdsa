@@ -1287,13 +1287,14 @@ mod test {
     fn presign_produces_valid_outputs() -> Result<()> {
         let quorum_size = 4;
         let rng = &mut init_testing();
-        let sid = Identifier::random(rng);
 
         // Prepare prereqs for making PresignParticipants. Assume all the simulations
         // are stable (e.g. keep config order)
         let configs = ParticipantConfig::random_quorum(quorum_size, rng)?;
         let keygen_outputs = keygen::Output::simulate_set(&configs, rng);
         let auxinfo_outputs = auxinfo::Output::simulate_set(&configs, rng);
+
+        let sid = Identifier::random(rng);
 
         // Make the participants
         let mut quorum = zip(configs, zip(keygen_outputs.clone(), auxinfo_outputs))
@@ -1348,8 +1349,10 @@ mod test {
             }
         }
 
-        // Every party produced an output
-        let records: Vec<_> = outputs.into_iter().flatten().collect();
+        // Get rid of any `None` outputs
+        let records = outputs.into_iter().flatten().collect::<Vec<_>>();
+
+        // Every party must produce an output
         assert_eq!(records.len(), quorum_size);
 
         // Check validity of set; this will panic if anything is wrong

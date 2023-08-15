@@ -8,21 +8,30 @@
 //! This module instantiates a [`SignParticipant`] which implements the
 //! signing protocol.
 
+use generic_array::{typenum::U32, GenericArray};
+use k256::{
+    ecdsa::{signature::DigestVerifier, VerifyingKey},
+    elliptic_curve::{ops::Reduce, subtle::ConditionallySelectable, IsHigh},
+    Scalar, U256,
+};
 use rand::{CryptoRng, RngCore};
+use sha2::{Digest, Sha256};
 use tracing::{error, info, warn};
+use zeroize::Zeroize;
 
 use crate::{
     errors::{CallerError, InternalError, Result},
+    keygen::KeySharePublic,
     local_storage::LocalStorage,
     messages::{Message, MessageType, SignMessageType},
     participant::{InnerProtocolParticipant, ProcessOutcome},
     protocol::{ProtocolType, SharedContext},
     run_only_once,
+    sign::share::{Signature, SignatureShare},
+    utils::CurvePoint,
     zkp::ProofContext,
     Identifier, ParticipantConfig, ParticipantIdentifier, PresignRecord, ProtocolParticipant,
 };
-
-use super::share::Signature;
 
 /// A participant that runs the signing protocol in Figure 8 of Canetti et
 /// al[^cite].
@@ -68,23 +77,57 @@ pub struct SignParticipant {
     status: Status,
 }
 
-/// Input for a [`SignParticipant`].
-#[allow(unused)]
+/// Input for the signing protocol.
 #[derive(Debug)]
 pub struct Input {
-    message_digest: Box<[u8; 32]>,
+    message_digest: Sha256,
     presign_record: PresignRecord,
+    public_key_shares: Vec<KeySharePublic>,
 }
 
 impl Input {
-    #[allow(unused)]
+    /// Construct a new input for signing.
+    ///
+    /// The `public_key_shares` should be the same ones used to generate the
+    /// [`PresignRecord`].
+    pub fn new(
+        digest: Sha256,
+        record: PresignRecord,
+        public_key_shares: Vec<KeySharePublic>,
+    ) -> Self {
+        Self {
+            message_digest: digest,
+            presign_record: record,
+            public_key_shares,
+        }
+    }
+
+    /// Retrieve the presign record.
     pub(crate) fn presign_record(&self) -> &PresignRecord {
         &self.presign_record
+    }
+
+    /// Compute the digest. Note that this forces a clone of the `Sha256`
+    /// object.
+    pub(crate) fn digest(&self) -> GenericArray<u8, U32> {
+        self.message_digest.clone().finalize()
+    }
+
+    pub(crate) fn public_key(&self) -> Result<k256::ecdsa::VerifyingKey> {
+        // Add up all the key shares
+        let public_key_point = self
+            .public_key_shares
+            .iter()
+            .fold(CurvePoint::IDENTITY, |sum, share| sum + *share.as_ref());
+
+        VerifyingKey::from_encoded_point(&public_key_point.0.to_affine().into()).map_err(|_| {
+            error!("Keygen output does not produce a valid public key");
+            CallerError::BadInput.into()
+        })
     }
 }
 
 /// Protocol status for [`SignParticipant`].
-#[allow(unused)]
 #[derive(Debug, PartialEq)]
 pub enum Status {
     /// Participant is created but has not received a ready message from self.
@@ -121,21 +164,27 @@ impl SignContext {
     pub(crate) fn collect(p: &SignParticipant) -> Self {
         Self {
             shared_context: SharedContext::collect(p),
-            message_digest: *p.input().message_digest,
+            message_digest: p.input().digest().into(),
         }
     }
 }
 
 mod storage {
+    use k256::Scalar;
+
     use crate::{local_storage::TypeTag, sign::share::SignatureShare};
 
     pub(super) struct Share;
     impl TypeTag for Share {
         type Value = SignatureShare;
     }
+
+    pub(super) struct XProj;
+    impl TypeTag for XProj {
+        type Value = Scalar;
+    }
 }
 
-#[allow(unused)]
 impl ProtocolParticipant for SignParticipant {
     type Input = Input;
     type Output = Signature;
@@ -181,7 +230,10 @@ impl ProtocolParticipant for SignParticipant {
         rng: &mut R,
         message: &Message,
     ) -> Result<ProcessOutcome<Self::Output>> {
-        info!("Processing signing message.");
+        info!(
+            "Processing signing message of type {:?}",
+            message.message_type()
+        );
 
         if *self.status() == Status::TerminatedSuccessfully {
             Err(CallerError::ProtocolAlreadyTerminated)?;
@@ -194,9 +246,7 @@ impl ProtocolParticipant for SignParticipant {
 
         match message.message_type() {
             MessageType::Sign(SignMessageType::Ready) => self.handle_ready_message(rng, message),
-            MessageType::Sign(SignMessageType::RoundOneShare) => {
-                self.handle_round_one_msg(rng, message)
-            }
+            MessageType::Sign(SignMessageType::RoundOneShare) => self.handle_round_one_msg(message),
             message_type => {
                 error!(
                     "Invalid MessageType passed to SignParticipant. Got: {:?}",
@@ -262,45 +312,326 @@ impl SignParticipant {
         rng: &mut R,
         message: &Message,
     ) -> Result<ProcessOutcome<<Self as ProtocolParticipant>::Output>> {
-        info!("Handling sign ready message.");
-
         let ready_outcome = self.process_ready_message(rng, message)?;
-        let round_one_messages = run_only_once!(self.gen_round_one_msgs(rng, message.id()))?;
-        // extend the output with round one messages (if they hadn't already been
-        // generated)
-        Ok(ready_outcome.with_messages(round_one_messages))
+
+        // Generate round 1 messages
+        let round_one_messages = run_only_once!(self.gen_round_one_msgs(rng, self.sid()))?;
+
+        // If our generated share was the last one, complete the protocol.
+        if self
+            .storage
+            .contains_for_all_ids::<storage::Share>(&self.all_participants())
+        {
+            let round_one_outcome = self.compute_output()?;
+            ready_outcome
+                .with_messages(round_one_messages)
+                .consolidate(vec![round_one_outcome])
+        } else {
+            // Otherwise, just return the new messages
+            Ok(ready_outcome.with_messages(round_one_messages))
+        }
     }
 
-    #[allow(unused)]
     fn gen_round_one_msgs<R: RngCore + CryptoRng>(
         &mut self,
-        rng: &mut R,
-        sid: Identifier,
+        _rng: &mut R,
+        _sid: Identifier,
     ) -> Result<Vec<Message>> {
+        let record = self.input.presign_record();
+
+        // Interpret the message digest as an integer mod `q`. This matches the way that
+        // the k256 library converts a digest to a scalar.
+        let digest = <Scalar as Reduce<U256>>::from_be_bytes_reduced(self.input.digest());
+
         // Compute the x-projection of `R` from the `PresignRecord`
+        let x_projection = record.x_projection()?;
 
         // Compute the share
+        let share = SignatureShare::new(
+            record.mask_share() * &digest + (x_projection * record.masked_key_share()),
+        );
+
+        // Erase the presign record
+        self.input.presign_record.zeroize();
+
+        // Save pieces for our own use later
+        self.storage
+            .store::<storage::Share>(self.id(), share.clone());
+        self.storage
+            .store::<storage::XProj>(self.id(), x_projection);
 
         // Form output messages
-        todo!()
+        self.message_for_other_participants(
+            MessageType::Sign(SignMessageType::RoundOneShare),
+            share,
+        )
     }
 
-    #[allow(unused)]
-    fn handle_round_one_msg<R: RngCore + CryptoRng>(
+    fn handle_round_one_msg(
         &mut self,
-        rng: &mut R,
         message: &Message,
     ) -> Result<ProcessOutcome<<Self as ProtocolParticipant>::Output>> {
-        // Stash signature share
+        // Make sure we're ready to process incoming messages
+        if !self.is_ready() {
+            self.stash_message(message)?;
+            return Ok(ProcessOutcome::Incomplete);
+        }
 
-        // If we've received all messages...
+        // Save this signature share
+        let share = SignatureShare::try_from(message)?;
+        self.storage.store::<storage::Share>(message.from(), share);
 
-        // Compute full signature
+        // If we haven't received shares from all parties, stop here
+        if !self
+            .storage
+            .contains_for_all_ids::<storage::Share>(&self.all_participants())
+        {
+            return Ok(ProcessOutcome::Incomplete);
+        }
 
-        // Verify signature (how? -- might need to add input from auxinfo + keygen)
+        // Otherwise, continue on to run the `Output` step of the protocol
+        self.compute_output()
+    }
 
-        // Output full signature (TODO: add type)
+    /// Completes the "output" step of the protocol. This method assumes that
+    /// you have received a share from every participant, including
+    /// yourself!
+    fn compute_output(&mut self) -> Result<ProcessOutcome<<Self as ProtocolParticipant>::Output>> {
+        // Retrieve everyone's share and the x-projection we saved in round one
+        // (This will fail if we're missing any shares)
+        let shares = self
+            .all_participants()
+            .into_iter()
+            .map(|pid| self.storage.remove::<storage::Share>(pid))
+            .collect::<Result<Vec<_>>>()?;
+        let x_projection = self.storage.remove::<storage::XProj>(self.id())?;
 
-        todo!()
+        // Sum up the signature shares and convert to BIP-0062 format (negating if the
+        // sum is > group order /2)
+        let mut sum = shares.into_iter().fold(Scalar::ZERO, |a, b| a + b);
+        sum.conditional_assign(&sum.negate(), sum.is_high());
+
+        let signature = Signature::try_from_scalars(x_projection, sum)?;
+
+        // Verify signature
+        self.input
+            .public_key()?
+            .verify_digest(self.input.message_digest.clone(), signature.as_ref())
+            .map_err(|e| {
+                error!("Failed to verify signature {:?}", e);
+                InternalError::ProtocolError
+            })?;
+
+        // Output full signature
+        self.status = Status::TerminatedSuccessfully;
+        Ok(ProcessOutcome::Terminated(signature))
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use std::collections::HashMap;
+
+    use k256::{
+        ecdsa::signature::{DigestVerifier, Verifier},
+        elliptic_curve::{ops::Reduce, subtle::ConditionallySelectable, IsHigh},
+        Scalar, U256,
+    };
+    use rand::{CryptoRng, Rng, RngCore};
+    use sha2::{Digest, Sha256};
+    use tracing::debug;
+
+    use crate::{
+        errors::Result,
+        keygen,
+        messages::{Message, MessageType},
+        participant::ProcessOutcome,
+        presign::PresignRecord,
+        sign::{self, participant::Status, share::Signature},
+        utils::{bn_to_scalar, testing::init_testing},
+        Identifier, ParticipantConfig, ProtocolParticipant,
+    };
+
+    use super::SignParticipant;
+
+    /// Pick a random incoming message and have the correct participant process
+    /// it.
+    fn process_messages<'a, R: RngCore + CryptoRng>(
+        quorum: &'a mut [SignParticipant],
+        inbox: &mut Vec<Message>,
+        rng: &mut R,
+    ) -> Option<(&'a SignParticipant, ProcessOutcome<Signature>)> {
+        // Pick a random message to process
+        if inbox.is_empty() {
+            return None;
+        }
+        let message = inbox.swap_remove(rng.gen_range(0..inbox.len()));
+        let participant = quorum.iter_mut().find(|p| p.id() == message.to()).unwrap();
+
+        debug!(
+            "processing participant: {}, with message type: {:?} from {}",
+            &message.to(),
+            &message.message_type(),
+            &message.from(),
+        );
+
+        let outcome = participant.process_message(rng, &message).unwrap();
+        Some((participant, outcome))
+    }
+
+    #[test]
+    fn signing_always_works() {
+        for _ in 0..1000 {
+            signing_produces_valid_signature().unwrap()
+        }
+    }
+
+    /// This method is used for debugging. It "simulates" the non-distributed
+    /// ECDSA signing algorithm by reconstructing the mask `k` and secret
+    /// key fields from the presign records and keygen outputs,
+    /// respectively, and using them to compute the signature.
+    ///
+    /// It can be used to check that the distributed signature is being computed
+    /// correctly according to the presign record.
+    fn compute_non_distributed_ecdsa(
+        message: &[u8],
+        records: &[PresignRecord],
+        keygen_outputs: &[keygen::Output],
+    ) -> k256::ecdsa::Signature {
+        let k = records
+            .iter()
+            .map(|record| record.mask_share())
+            .fold(Scalar::ZERO, |a, b| a + b);
+
+        let secret_key = keygen_outputs
+            .iter()
+            .map(|output| bn_to_scalar(output.private_key_share().as_ref()).unwrap())
+            .fold(Scalar::ZERO, |a, b| a + b);
+
+        let r = records[0].x_projection().unwrap();
+
+        let m = <Scalar as Reduce<U256>>::from_be_bytes_reduced(Sha256::digest(message));
+
+        let mut s = k * (m + r * secret_key);
+        s.conditional_assign(&s.negate(), s.is_high());
+
+        let signature = k256::ecdsa::Signature::from_scalars(r, s).unwrap();
+
+        // These checks fail when the overall thing fails
+        let public_key = keygen_outputs[0].public_key().unwrap();
+
+        assert!(public_key.verify(message, &signature).is_ok());
+        assert!(public_key
+            .verify_digest(Sha256::new().chain(message), &signature)
+            .is_ok());
+        signature
+    }
+
+    #[test]
+    fn signing_produces_valid_signature() -> Result<()> {
+        let quorum_size = 4;
+        let rng = &mut init_testing();
+        let sid = Identifier::random(rng);
+
+        // Prepare prereqs for making SignParticipants. Assume all the simulations
+        // are stable (e.g. keep config order)
+        let configs = ParticipantConfig::random_quorum(quorum_size, rng)?;
+        let keygen_outputs = keygen::Output::simulate_set(&configs, rng);
+        let presign_records = PresignRecord::simulate_set(&keygen_outputs, rng);
+
+        let message = b"the quick brown fox jumped over the lazy dog";
+        let message_digest = sha2::Sha256::new().chain(message);
+
+        // Save some things for later -- a signature constructucted from the records and
+        // the public key
+        let non_distributed_sig =
+            compute_non_distributed_ecdsa(message, &presign_records, &keygen_outputs);
+        let public_key = &keygen_outputs[0].public_key().unwrap();
+
+        // Form signing inputs and participants
+        let inputs = std::iter::zip(keygen_outputs, presign_records).map(|(keygen, record)| {
+            sign::Input::new(
+                message_digest.clone(),
+                record,
+                keygen.public_key_shares().to_vec(),
+            )
+        });
+        let mut quorum =
+            std::iter::zip(ParticipantConfig::random_quorum(quorum_size, rng)?, inputs)
+                .map(|(config, input)| {
+                    SignParticipant::new(sid, config.id(), config.other_ids().to_vec(), input)
+                })
+                .collect::<Result<Vec<_>>>()?;
+
+        // Prepare caching of data (outputs and messages) for protocol execution
+        let mut outputs = HashMap::with_capacity(quorum_size);
+
+        let mut inbox = Vec::new();
+        for participant in &quorum {
+            let empty: [u8; 0] = [];
+            inbox.push(Message::new(
+                MessageType::Sign(crate::messages::SignMessageType::Ready),
+                sid,
+                participant.id(),
+                participant.id(),
+                &empty,
+            )?);
+        }
+
+        // Run protocol until all participants report that they're done
+        while !quorum
+            .iter()
+            .all(|participant| *participant.status() == Status::TerminatedSuccessfully)
+        {
+            let (processor, outcome) = match process_messages(&mut quorum, &mut inbox, rng) {
+                None => continue,
+                Some(x) => x,
+            };
+
+            // Deliver messages and save outputs
+            match outcome {
+                ProcessOutcome::Incomplete => {}
+                ProcessOutcome::Processed(messages) => inbox.extend(messages),
+                ProcessOutcome::Terminated(output) => {
+                    assert!(outputs.insert(processor.id(), output).is_none())
+                }
+                ProcessOutcome::TerminatedForThisParticipant(output, messages) => {
+                    inbox.extend(messages);
+                    assert!(outputs.insert(processor.id(), output).is_none());
+                }
+            }
+
+            // Debug check -- did we process all the messages without finishing the
+            // protocol?
+            if inbox.is_empty()
+                && !quorum
+                    .iter()
+                    .all(|p| *p.status() == Status::TerminatedSuccessfully)
+            {
+                panic!("we're stuck")
+            }
+        }
+
+        // Everyone should have gotten an output
+        assert_eq!(outputs.len(), quorum.len());
+        let signatures = outputs.into_values().collect::<Vec<_>>();
+
+        // Everyone should have gotten the same output. We don't use a hashset because
+        // the underlying signature type doesn't derive `Hash`
+        assert!(signatures
+            .windows(2)
+            .all(|signature| signature[0] == signature[1]));
+
+        // Make sure the signature we got matches the non-distributed one
+        let distributed_sig = &signatures[0];
+        assert_eq!(distributed_sig.as_ref(), &non_distributed_sig);
+
+        // Verify that we have a valid signature under the public key for the `message`
+        assert!(public_key.verify(message, distributed_sig.as_ref()).is_ok());
+        assert!(public_key
+            .verify_digest(Sha256::new().chain(message), distributed_sig.as_ref())
+            .is_ok());
+
+        Ok(())
     }
 }

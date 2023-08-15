@@ -56,7 +56,7 @@ pub(crate) struct RecordPair {
 /// d_A)`, which is exactly a valid (normal) ECDSA signature.
 ///
 /// [^cite]: [Wikipedia](https://en.wikipedia.org/wiki/Elliptic_Curve_Digital_Signature_Algorithm#Signature_generation_algorithm)
-#[derive(ZeroizeOnDrop, PartialEq, Eq)]
+#[derive(Zeroize, ZeroizeOnDrop, PartialEq, Eq)]
 pub struct PresignRecord {
     R: CurvePoint,
     k: Scalar,
@@ -109,6 +109,15 @@ impl TryFrom<RecordPair> for PresignRecord {
 }
 
 impl PresignRecord {
+    /// Get the mask share (`k` in the paper) from the record.
+    pub(crate) fn mask_share(&self) -> &Scalar {
+        &self.k
+    }
+
+    /// Get the masked key share (`chi` in the paper) from the record.
+    pub(crate) fn masked_key_share(&self) -> &Scalar {
+        &self.chi
+    }
     /// Compute the x-projection of the randomly-selected point `R` from the
     /// [`PresignRecord`].
     pub(crate) fn x_projection(&self) -> Result<Scalar> {
@@ -272,7 +281,6 @@ mod tests {
         elliptic_curve::{Field, Group},
         ProjectivePoint, Scalar,
     };
-    use libpaillier::unknown_order::BigNumber;
     use rand::{rngs::StdRng, CryptoRng, Rng, RngCore, SeedableRng};
 
     use crate::{
@@ -285,14 +293,6 @@ mod tests {
     impl PresignRecord {
         pub(crate) fn mask_point(&self) -> &CurvePoint {
             &self.R
-        }
-
-        pub(crate) fn mask_share(&self) -> &Scalar {
-            &self.k
-        }
-
-        pub(crate) fn masked_key_share(&self) -> &Scalar {
-            &self.chi
         }
 
         /// Simulate creation of a random presign record. Do not use outside of
@@ -330,23 +330,11 @@ mod tests {
             // `R` in the paper.
             let mask_point = CurvePoint::GENERATOR.multiply_by_scalar(&mask_inversion);
 
-            let secret_key = keygen_outputs
+            // Compute the masked key shares as (secret_key_share * mask)
+            let masked_key_shares = keygen_outputs
                 .iter()
-                .map(|output| output.private_key_share())
-                .fold(BigNumber::zero(), |sum, key_share| sum + key_share.as_ref());
-
-            // Make all but one of the masked key shares randomly
-            let mut masked_key_shares =
-                std::iter::repeat_with(|| Scalar::random(StdRng::from_seed(rng.gen())))
-                    .take(keygen_outputs.len() - 1)
-                    .collect::<Vec<_>>();
-            let almost_masked_key = masked_key_shares
-                .iter()
-                .fold(Scalar::ZERO, |sum, masked_share| sum + masked_share);
-
-            // Compute the last key share to force correctness. We need to enforce that
-            // sum(masked_key_shares) = secret_key * mask (mod q)
-            masked_key_shares.push(bn_to_scalar(&secret_key).unwrap() * mask - almost_masked_key);
+                .map(|output| bn_to_scalar(output.private_key_share().as_ref()).unwrap())
+                .map(|secret_key_share| secret_key_share * mask);
 
             assert_eq!(masked_key_shares.len(), keygen_outputs.len());
             assert_eq!(mask_shares.len(), keygen_outputs.len());
