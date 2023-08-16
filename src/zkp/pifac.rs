@@ -331,7 +331,11 @@ fn sqrt(num: &BigNumber) -> BigNumber {
 
 #[cfg(test)]
 mod tests {
-    use crate::{paillier::prime_gen, utils::testing::init_testing, zkp::BadContext};
+    use crate::{
+        paillier::prime_gen,
+        utils::{k256_order, random_positive_bn, testing::init_testing},
+        zkp::BadContext,
+    };
     use rand::{prelude::StdRng, Rng, SeedableRng};
 
     use super::*;
@@ -383,7 +387,7 @@ mod tests {
     }
 
     #[test]
-    fn test_no_small_factors_proof_negative_cases() -> Result<()> {
+    fn modulus_common_input_must_be_same_proving_and_verifying() -> Result<()> {
         let mut rng = init_testing();
         // `rng` will be borrowed. We make another rng to be captured by the closure.
         let mut rng2 = StdRng::from_seed(rng.gen());
@@ -396,20 +400,31 @@ mod tests {
             assert!(proof.verify(incorrect_N, &(), &mut transcript()).is_err());
             Ok(())
         };
-        with_random_no_small_factors_proof(&mut rng, modulus_must_match)?;
+        with_random_no_small_factors_proof(&mut rng, modulus_must_match)
+    }
 
+    #[test]
+    fn setup_params_common_input_must_be_same_proving_and_verifying() -> Result<()> {
+        let mut rng = init_testing();
         // Setup parameters in the common input must be the same at proof creation and
         // verification.
         let setup_params_must_match = |input: CommonInput, proof: PiFacProof| {
-            let setup_param = VerifiedRingPedersen::gen(&mut rng2, &())?;
+            let mut rng = init_testing();
+            let setup_param = VerifiedRingPedersen::gen(&mut rng, &())?;
             let incorrect_startup_params = CommonInput::new(&setup_param, input.modulus);
             assert!(proof
                 .verify(incorrect_startup_params, &(), &mut transcript())
                 .is_err());
             Ok(())
         };
-        with_random_no_small_factors_proof(&mut rng, setup_params_must_match)?;
+        with_random_no_small_factors_proof(&mut rng, setup_params_must_match)
+    }
 
+    #[test]
+    fn test_no_small_factors_proof_negative_cases() -> Result<()> {
+        let mut rng = init_testing();
+        // `rng` will be borrowed. We make another rng to be captured by the closure.
+        let mut rng2 = StdRng::from_seed(rng.gen());
         // Prover secret must have correct factors for the modulus in the common input.
         let correct_factors = |input: CommonInput, _proof: PiFacProof| {
             let (not_p0, not_q0) = prime_gen::get_prime_pair_from_pool_insecure(&mut rng2).unwrap();
@@ -458,28 +473,41 @@ mod tests {
                 .verify(mixed_input, &(), &mut transcript())
                 .is_err());
 
+            let regular_sized_p = prime_gen::try_get_prime_from_pool_insecure(&mut rng2).unwrap();
+            let modulus = &regular_sized_p * &small_q;
+            let mixed_input = CommonInput::new(&setup_params, &modulus);
+            let mixed_proof = PiFacProof::prove(
+                input,
+                ProverSecret::new(&regular_sized_p, &small_q),
+                &(),
+                &mut transcript(),
+                &mut rng2,
+            )?;
+
+            assert!(mixed_proof
+                .verify(mixed_input, &(), &mut transcript())
+                .is_err());
+
             Ok(())
         };
         with_random_no_small_factors_proof(&mut rng, correct_factors)
     }
 
-    /// TODO: This test does not currently work. It should be addressed as part
-    /// of issue #113.
-    // #[test]
-    #[allow(dead_code)]
-    fn test_modulus_cannot_have_small_factors() -> Result<()> {
+    #[test]
+    fn test_modulus_cannot_have_large_factors() -> Result<()> {
         let mut rng = init_testing();
-        let (not_p0, _) = prime_gen::get_prime_pair_from_pool_insecure(&mut rng).unwrap();
-        let regular_sized_q = prime_gen::try_get_prime_from_pool_insecure(&mut rng).unwrap();
+        let (regular_sized_p, regular_sized_q) =
+            prime_gen::get_prime_pair_from_pool_insecure(&mut rng).unwrap();
         let setup_params = VerifiedRingPedersen::gen(&mut rng, &())?;
 
-        let small_fac_p = &not_p0 * &BigNumber::from(2u64);
-        let modulus = &small_fac_p * &regular_sized_q;
+        let small_factor = BigNumber::from(2u64);
+        let large_factor = &regular_sized_p * &regular_sized_q;
+        let modulus = &small_factor * &large_factor;
 
         let small_fac_input = CommonInput::new(&setup_params, &modulus);
         let small_fac_proof = PiFacProof::prove(
             small_fac_input,
-            ProverSecret::new(&small_fac_p, &regular_sized_q),
+            ProverSecret::new(&small_factor, &large_factor),
             &(),
             &mut transcript(),
             &mut rng,
@@ -488,7 +516,110 @@ mod tests {
         assert!(small_fac_proof
             .verify(small_fac_input, &(), &mut transcript())
             .is_err());
+
+        let small_fac_proof = PiFacProof::prove(
+            small_fac_input,
+            ProverSecret::new(&large_factor, &small_factor),
+            &(),
+            &mut transcript(),
+            &mut rng,
+        )?;
+
+        assert!(small_fac_proof
+            .verify(small_fac_input, &(), &mut transcript())
+            .is_err());
+
         Ok(())
+    }
+
+    #[test]
+    fn proof_elements_should_be_correct() -> Result<()> {
+        let mut rng = init_testing();
+        // `rng` will be borrowed. We make another rng to be captured by the closure.
+        let mut rng2 = StdRng::from_seed(rng.gen());
+        let proof_elements_must_be_correct = |input: CommonInput, proof: PiFacProof| {
+            let mut incorrect_proof = proof.clone();
+            let random_bignumber = random_positive_bn(&mut rng, &k256_order());
+            incorrect_proof.p_masked = random_bignumber.clone();
+            assert!(incorrect_proof
+                .verify(input, &(), &mut transcript())
+                .is_err());
+            let mut incorrect_proof = proof.clone();
+
+            incorrect_proof.q_masked = random_bignumber.clone();
+            assert!(incorrect_proof
+                .verify(input, &(), &mut transcript())
+                .is_err());
+
+            let mut incorrect_proof = proof.clone();
+            let scheme = VerifiedRingPedersen::gen(&mut rng, &())?;
+            let (random_commitment, _) = scheme.scheme().commit(&random_bignumber, ELL, &mut rng);
+            incorrect_proof.p_commitment = random_commitment.clone();
+            assert!(incorrect_proof
+                .verify(input, &(), &mut transcript())
+                .is_err());
+
+            let mut incorrect_proof = proof.clone();
+            incorrect_proof.q_commitment = random_commitment.clone();
+            assert!(incorrect_proof
+                .verify(input, &(), &mut transcript())
+                .is_err());
+
+            let mut incorrect_proof = proof.clone();
+            let (random_commitment, random_commmitment_randomness) =
+                scheme
+                    .scheme()
+                    .commit(&random_bignumber, ELL + EPSILON, &mut rng);
+            incorrect_proof.p_mask_commitment = random_commitment.clone();
+            assert!(incorrect_proof
+                .verify(input, &(), &mut transcript())
+                .is_err());
+
+            let mut incorrect_proof = proof.clone();
+            incorrect_proof.q_mask_commitment = random_commitment.clone();
+            assert!(incorrect_proof
+                .verify(input, &(), &mut transcript())
+                .is_err());
+
+            let (q_link_commitment, _) = input.setup_params.scheme().commit_with_commitment(
+                &proof.q_commitment,
+                &proof.p_masked,
+                ELL + EPSILON,
+                input.modulus,
+                &mut rng,
+            );
+            let mut incorrect_proof = proof.clone();
+            incorrect_proof.q_link_commitment = q_link_commitment;
+            assert!(incorrect_proof
+                .verify(input, &(), &mut transcript())
+                .is_err());
+            let mut incorrect_proof = proof.clone();
+            incorrect_proof.link_randomness = random_commmitment_randomness.clone();
+            assert!(incorrect_proof
+                .verify(input, &(), &mut transcript())
+                .is_err());
+
+            let mut incorrect_proof = proof.clone();
+            let random_masked_randomness = random_commmitment_randomness.as_masked();
+            incorrect_proof.masked_p_commitment_randomness = random_masked_randomness.clone();
+            assert!(incorrect_proof
+                .verify(input, &(), &mut transcript())
+                .is_err());
+
+            let mut incorrect_proof = proof.clone();
+            incorrect_proof.masked_q_commitment_randomness = random_masked_randomness.clone();
+            assert!(incorrect_proof
+                .verify(input, &(), &mut transcript())
+                .is_err());
+
+            let mut incorrect_proof = proof.clone();
+            incorrect_proof.masked_p_link = random_masked_randomness.clone();
+            assert!(incorrect_proof
+                .verify(input, &(), &mut transcript())
+                .is_err());
+            Ok(())
+        };
+        with_random_no_small_factors_proof(&mut rng2, proof_elements_must_be_correct)
     }
 
     #[test]
