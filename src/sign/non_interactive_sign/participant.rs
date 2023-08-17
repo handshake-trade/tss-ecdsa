@@ -5,9 +5,6 @@
 // License, Version 2.0 found in the LICENSE-APACHE file in the root directory
 // of this source tree.
 
-//! This module instantiates a [`SignParticipant`] which implements the
-//! signing protocol.
-
 use generic_array::{typenum::U32, GenericArray};
 use k256::{
     ecdsa::{signature::DigestVerifier, VerifyingKey},
@@ -27,21 +24,18 @@ use crate::{
     participant::{InnerProtocolParticipant, ProcessOutcome},
     protocol::{ProtocolType, SharedContext},
     run_only_once,
-    sign::share::{Signature, SignatureShare},
+    sign::{non_interactive_sign::share::SignatureShare, Signature},
     utils::CurvePoint,
     zkp::ProofContext,
     Identifier, ParticipantConfig, ParticipantIdentifier, PresignRecord, ProtocolParticipant,
 };
 
-/// A participant that runs the signing protocol in Figure 8 of Canetti et
-/// al[^cite].
+/// A participant that runs the non-interactive signing protocol in Figure 8 of
+/// Canetti et al[^cite].
 ///
 /// Note that this only runs Figure 8. By itself, this corresponds to the
 /// non-interactive signing protocol; it expects a
-/// [`PresignRecord`](crate::PresignRecord) as input. It could be
-/// used as a component to execute the interactive signing protocol, but this is
-/// not yet implemented.
-///
+/// [`PresignRecord`](crate::PresignRecord) as input.
 ///
 /// # Protocol input
 /// The protocol takes two fields as input:
@@ -68,7 +62,7 @@ use crate::{
 /// Makriyannis, and Udi Peled. UC Non-Interactive, Proactive, Threshold ECDSA
 /// with Identifiable Aborts. [EPrint archive,
 /// 2021](https://eprint.iacr.org/2021/060.pdf).
-
+#[derive(Debug)]
 pub struct SignParticipant {
     sid: Identifier,
     storage: LocalStorage,
@@ -77,7 +71,7 @@ pub struct SignParticipant {
     status: Status,
 }
 
-/// Input for the signing protocol.
+/// Input for the non-interactive signing protocol.
 #[derive(Debug)]
 pub struct Input {
     message_digest: Sha256,
@@ -172,7 +166,7 @@ impl SignContext {
 mod storage {
     use k256::Scalar;
 
-    use crate::{local_storage::TypeTag, sign::share::SignatureShare};
+    use crate::{local_storage::TypeTag, sign::non_interactive_sign::share::SignatureShare};
 
     pub(super) struct Share;
     impl TypeTag for Share {
@@ -447,7 +441,7 @@ mod test {
         messages::{Message, MessageType},
         participant::ProcessOutcome,
         presign::PresignRecord,
-        sign::{self, participant::Status, share::Signature},
+        sign::{self, non_interactive_sign::participant::Status, Signature},
         utils::{bn_to_scalar, testing::init_testing},
         Identifier, ParticipantConfig, ProtocolParticipant,
     };
