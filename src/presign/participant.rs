@@ -73,15 +73,6 @@ mod storage {
     }
 }
 
-/// Protocol status for [`PresignParticipant`].
-#[derive(Debug, PartialEq)]
-pub enum Status {
-    /// Participant has been initialized.
-    Initialized,
-    /// Participant has finished the sub-protocol.
-    TerminatedSuccessfully,
-}
-
 /// This type includes relevant context for transcripts produced in `presign`,
 /// and includes [`SharedContext`] and [`AuxInfoPublic`]s for all participants
 /// (including this participant).
@@ -222,14 +213,11 @@ pub struct PresignParticipant {
     broadcast_participant: BroadcastParticipant,
     /// Status of the protocol execution.
     status: Status,
-    /// Whether or not the participant is Ready
-    ready: bool,
 }
 
 impl ProtocolParticipant for PresignParticipant {
     type Input = Input;
     type Output = PresignRecord;
-    type Status = Status;
 
     fn new(
         sid: Identifier,
@@ -268,8 +256,7 @@ impl ProtocolParticipant for PresignParticipant {
             other_participant_ids: other_participant_ids.clone(),
             local_storage: Default::default(),
             broadcast_participant: BroadcastParticipant::new(sid, id, other_participant_ids, ())?,
-            status: Status::Initialized,
-            ready: false,
+            status: Status::NotReady,
         })
     }
 
@@ -313,7 +300,7 @@ impl ProtocolParticipant for PresignParticipant {
             Err(CallerError::ProtocolAlreadyTerminated)?;
         }
 
-        if !self.is_ready() && message.message_type() != Self::ready_type() {
+        if !self.status().is_ready() && message.message_type() != Self::ready_type() {
             self.stash_message(message)?;
             return Ok(ProcessOutcome::Incomplete);
         }
@@ -345,12 +332,8 @@ impl ProtocolParticipant for PresignParticipant {
         }
     }
 
-    fn status(&self) -> &Self::Status {
+    fn status(&self) -> &Status {
         &self.status
-    }
-
-    fn is_ready(&self) -> bool {
-        self.ready
     }
 }
 
@@ -369,8 +352,8 @@ impl InnerProtocolParticipant for PresignParticipant {
         &mut self.local_storage
     }
 
-    fn set_ready(&mut self) {
-        self.ready = true;
+    fn status_mut(&mut self) -> &mut Status {
+        &mut self.status
     }
 }
 
@@ -1186,6 +1169,7 @@ impl PresignKeyShareAndInfo {
     }
 }
 
+use crate::participant::Status;
 #[cfg(test)]
 pub(super) use test::presign_record_set_is_valid;
 
@@ -1203,13 +1187,13 @@ mod test {
         errors::Result,
         keygen,
         messages::{Message, MessageType, PresignMessageType},
-        participant::ProcessOutcome,
+        participant::{ProcessOutcome, Status},
         presign::{Input, PresignRecord},
         utils::{self, testing::init_testing},
         Identifier, ParticipantConfig, ParticipantIdentifier, ProtocolParticipant,
     };
 
-    use super::{PresignParticipant, Status};
+    use super::PresignParticipant;
 
     fn deliver_all(
         messages: &[Message],

@@ -15,7 +15,7 @@ use k256::{
 };
 use rand::{CryptoRng, RngCore};
 use sha2::{Digest, Sha256};
-use tracing::{error, info, warn};
+use tracing::{error, info};
 use zeroize::Zeroize;
 
 use crate::{
@@ -23,7 +23,7 @@ use crate::{
     keygen::KeySharePublic,
     local_storage::LocalStorage,
     messages::{Message, MessageType, SignMessageType},
-    participant::{InnerProtocolParticipant, ProcessOutcome},
+    participant::{InnerProtocolParticipant, ProcessOutcome, Status},
     protocol::{ProtocolType, SharedContext},
     run_only_once,
     sign::{non_interactive_sign::share::SignatureShare, Signature},
@@ -123,17 +123,6 @@ impl Input {
     }
 }
 
-/// Protocol status for [`SignParticipant`].
-#[derive(Debug, PartialEq)]
-pub enum Status {
-    /// Participant is created but has not received a ready message from self.
-    NotReady,
-    /// Participant received a ready message and is executing the protocol.
-    Initialized,
-    /// Participant finished the protocol.
-    TerminatedSuccessfully,
-}
-
 /// Context for fiat-Shamir proofs generated in the non-interactive signing
 /// protocol.
 ///
@@ -184,7 +173,6 @@ mod storage {
 impl ProtocolParticipant for SignParticipant {
     type Input = Input;
     type Output = Signature;
-    type Status = Status;
 
     fn ready_type() -> MessageType {
         MessageType::Sign(SignMessageType::Ready)
@@ -249,7 +237,7 @@ impl ProtocolParticipant for SignParticipant {
             Err(CallerError::ProtocolAlreadyTerminated)?;
         }
 
-        if !self.is_ready() && message.message_type() != Self::ready_type() {
+        if !self.status().is_ready() && message.message_type() != Self::ready_type() {
             self.stash_message(message)?;
             return Ok(ProcessOutcome::Incomplete);
         }
@@ -267,7 +255,7 @@ impl ProtocolParticipant for SignParticipant {
         }
     }
 
-    fn status(&self) -> &Self::Status {
+    fn status(&self) -> &Status {
         &self.status
     }
 
@@ -277,10 +265,6 @@ impl ProtocolParticipant for SignParticipant {
 
     fn input(&self) -> &Self::Input {
         &self.input
-    }
-
-    fn is_ready(&self) -> bool {
-        self.status != Status::NotReady
     }
 }
 
@@ -299,16 +283,8 @@ impl InnerProtocolParticipant for SignParticipant {
         &mut self.storage
     }
 
-    fn set_ready(&mut self) {
-        if self.status == Status::NotReady {
-            self.status = Status::Initialized;
-        } else {
-            warn!(
-                "Something is strange in the status updates for signing.
-                 Tried to update from `NotReady` to `Initialized`, but status was {:?}",
-                self.status
-            )
-        }
+    fn status_mut(&mut self) -> &mut Status {
+        &mut self.status
     }
 }
 
@@ -382,7 +358,7 @@ impl SignParticipant {
         message: &Message,
     ) -> Result<ProcessOutcome<<Self as ProtocolParticipant>::Output>> {
         // Make sure we're ready to process incoming messages
-        if !self.is_ready() {
+        if !self.status().is_ready() {
             self.stash_message(message)?;
             return Ok(ProcessOutcome::Incomplete);
         }
@@ -455,9 +431,9 @@ mod test {
         errors::Result,
         keygen,
         messages::{Message, MessageType},
-        participant::ProcessOutcome,
+        participant::{ProcessOutcome, Status},
         presign::PresignRecord,
-        sign::{self, non_interactive_sign::participant::Status, Signature},
+        sign::{self, Signature},
         utils::{bn_to_scalar, testing::init_testing},
         Identifier, ParticipantConfig, ProtocolParticipant,
     };

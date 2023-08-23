@@ -173,8 +173,6 @@ pub trait ProtocolParticipant {
     type Input: Debug;
     /// Output type of a successful protocol execution.
     type Output: Debug;
-    /// Type to determine status of protocol execution.
-    type Status: Debug + PartialEq;
 
     /// Get the type of a "ready" message, signalling that a participant
     /// is ready to begin protocol execution.
@@ -243,16 +241,13 @@ pub trait ProtocolParticipant {
     ) -> Result<ProcessOutcome<Self::Output>>;
 
     /// The status of the protocol execution.
-    fn status(&self) -> &Self::Status;
+    fn status(&self) -> &Status;
 
     /// The session identifier for the current session
     fn sid(&self) -> Identifier;
 
     /// The input of the current session
     fn input(&self) -> &Self::Input;
-
-    /// Returns whether or not the Participant is Ready
-    fn is_ready(&self) -> bool;
 }
 
 pub(crate) trait InnerProtocolParticipant: ProtocolParticipant {
@@ -310,7 +305,15 @@ pub(crate) trait InnerProtocolParticipant: ProtocolParticipant {
 
         // Process any messages that had been received before the Ready signal
         let banked_messages = self.fetch_all_messages()?;
-        self.set_ready();
+
+        // Ensure our status is in the right state.
+        let status = self.status_mut();
+        if status != &Status::NotReady {
+            return Err(InternalError::UnexpectedStatus(status.clone()));
+        }
+        // And update to _ready_.
+        *status = Status::Initialized;
+
         let outcomes = banked_messages
             .iter()
             .map(|m| self.process_message(rng, m))
@@ -384,9 +387,7 @@ pub(crate) trait InnerProtocolParticipant: ProtocolParticipant {
         Ok(progress_storage.get(&func_name).is_some())
     }
 
-    /// Each `InnerProtocolParticipant` must have some kind of indicator for
-    /// when it is ready to process messages. This method turns it on.
-    fn set_ready(&mut self);
+    fn status_mut(&mut self) -> &mut Status;
 }
 
 pub(crate) trait Broadcast {
@@ -432,6 +433,48 @@ pub(crate) trait Broadcast {
             msg.message_type = message_type;
         }
         Ok(ProcessOutcome::from(output, messages))
+    }
+}
+
+/// Protocol status for implementors of [`ProtocolParticipant`].
+#[derive(Debug, Eq, PartialEq, Clone)]
+pub enum Status {
+    /// Participant is created but has not received a ready message from self.
+    NotReady,
+    /// Participant received a ready message and is executing the protocol.
+    Initialized,
+    /// Participant finished the protocol.
+    TerminatedSuccessfully,
+    /// Participant received a ready message and is running presign.
+    ///
+    /// This variant is used by
+    /// [`InteractiveSignParticipant`](crate::sign::InteractiveSignParticipant)
+    RunningPresign,
+    /// Participant completed presign and is running sign.
+    ///
+    /// This variant is used by
+    /// [`InteractiveSignParticipant`](crate::sign::InteractiveSignParticipant)
+    RunningSign,
+    /// A vector of participants that have completed a broadcast.
+    ///
+    /// This vector does _not_ correspond to those participants that have
+    /// _initialized_ (and hence successfully completed) a broadcast, but rather
+    /// the participants who, when either sending a message or _forwarding_ a
+    /// message, resulted in the completion of the broadcast. Since all
+    /// participants broadcast messages at the same time, this is used to track
+    /// termination of the protocol by tracking the vector _size_: If the size
+    /// is equal to the number of other participants then the broadcast has
+    /// completed (as this equates to this participant receiving the broadcasts
+    /// of all other participants, regardless of which participant was the one
+    /// who sent the final message "completing" a given broadcast).
+    ///
+    /// This variant is used by [`BroadcastParticipant`]
+    ParticipantCompletedBroadcast(Vec<ParticipantIdentifier>),
+}
+
+impl Status {
+    pub(crate) fn is_ready(&self) -> bool {
+        self != &Status::NotReady
     }
 }
 
