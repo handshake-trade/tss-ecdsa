@@ -4,7 +4,7 @@ use std::collections::HashSet;
 
 use crate::{
     auxinfo::info::{AuxInfoPrivate, AuxInfoPublic},
-    errors::{CallerError, Result},
+    errors::{CallerError, InternalError, Result},
     protocol::ParticipantIdentifier,
 };
 use tracing::error;
@@ -36,7 +36,7 @@ impl Output {
             .map(AuxInfoPublic::participant)
             .collect::<HashSet<_>>();
         if pids.len() != public_auxinfo.len() {
-            error!("Tried to create a keygen output using a set of public material from non-unique participants");
+            error!("Tried to create an auxinfo output using a set of public material from non-unique participants");
             Err(CallerError::BadInput)?
         }
 
@@ -73,6 +73,21 @@ impl Output {
         &self.public_auxinfo
     }
 
+    pub(crate) fn private_pid(&self) -> Result<ParticipantIdentifier> {
+        let expected_public_key = self.private_auxinfo.encryption_key();
+        match self
+            .public_auxinfo
+            .iter()
+            .find(|auxinfo| &expected_public_key == auxinfo.pk())
+        {
+            Some(public_auxinfo) => Ok(public_auxinfo.participant()),
+            None => {
+                error!("Didn't find public aux info corresponding to the private aux info, but there should be one by construction");
+                Err(InternalError::InternalInvariantFailed)
+            }
+        }
+    }
+
     pub(crate) fn find_public(&self, pid: ParticipantIdentifier) -> Option<&AuxInfoPublic> {
         self.public_auxinfo
             .iter()
@@ -93,10 +108,11 @@ mod tests {
     };
 
     impl Output {
-        /// Simulate the output of an auxinfo run with the given participants.
+        /// Simulate the valid output of an auxinfo run with the given
+        /// participants.
         ///
-        /// This should __never__ be called outside of tests! It does not
-        /// validate the PID input.
+        /// This should __never__ be called outside of tests! The given `pids`
+        /// must not contain duplicates.
         pub(crate) fn simulate(
             pids: &[ParticipantIdentifier],
             rng: &mut (impl CryptoRng + RngCore),
@@ -118,27 +134,24 @@ mod tests {
                 })
                 .unzip();
 
-            Self {
-                private_auxinfo: private_auxinfo.pop().unwrap(),
-                public_auxinfo,
-            }
+            Self::from_parts(public_auxinfo, private_auxinfo.pop().unwrap()).unwrap()
         }
 
-        /// Simulate a consistent output of an auxinfo run with the given
+        /// Simulate a consistent, valid output of an auxinfo run with the given
         /// participants.
         ///
         /// This produces output for every config in the provided set. The
-        /// config must have a non-zero length.
+        /// config must have a non-zero length and the given `pids` must not
+        /// contain duplicates.
         pub(crate) fn simulate_set(
             configs: &[ParticipantConfig],
             rng: &mut (impl CryptoRng + RngCore),
         ) -> Vec<Self> {
-            let (private_auxinfo, public_auxinfo): (Vec<_>, Vec<_>) = configs
+            let (public_auxinfo, private_auxinfo): (Vec<_>, Vec<_>) = configs
                 .iter()
                 .map(|config| {
                     let (key, _, _) = DecryptionKey::new(rng).unwrap();
                     (
-                        AuxInfoPrivate::from(key.clone()),
                         AuxInfoPublic::new(
                             &(),
                             config.id(),
@@ -146,15 +159,15 @@ mod tests {
                             VerifiedRingPedersen::extract(&key, &(), rng).unwrap(),
                         )
                         .unwrap(),
+                        AuxInfoPrivate::from(key),
                     )
                 })
                 .unzip();
 
             private_auxinfo
                 .into_iter()
-                .map(|private_auxinfo| Self {
-                    private_auxinfo,
-                    public_auxinfo: public_auxinfo.clone(),
+                .map(|private_auxinfo| {
+                    Self::from_parts(public_auxinfo.clone(), private_auxinfo).unwrap()
                 })
                 .collect()
         }
@@ -181,10 +194,24 @@ mod tests {
         // Duplicate one of the PIDs
         pids.push(pids[4]);
 
-        let output = Output::simulate(&pids, rng);
+        let (mut private_auxinfo, public_auxinfo): (Vec<_>, Vec<_>) = pids
+            .iter()
+            .map(|&pid| {
+                let (key, _, _) = DecryptionKey::new(rng).unwrap();
+                (
+                    AuxInfoPrivate::from(key.clone()),
+                    AuxInfoPublic::new(
+                        &(),
+                        pid,
+                        key.encryption_key(),
+                        VerifiedRingPedersen::extract(&key, &(), rng).unwrap(),
+                    )
+                    .unwrap(),
+                )
+            })
+            .unzip();
 
-        let (public, private) = output.into_parts();
-        assert!(Output::from_parts(public, private).is_err());
+        assert!(Output::from_parts(public_auxinfo, private_auxinfo.pop().unwrap()).is_err());
     }
 
     #[test]
