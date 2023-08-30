@@ -149,7 +149,7 @@ impl SignContext {
     pub(crate) fn collect(p: &SignParticipant) -> Self {
         Self {
             shared_context: SharedContext::collect(p),
-            message_digest: p.input().digest().into(),
+            message_digest: p.input.digest().into(),
         }
     }
 }
@@ -193,7 +193,7 @@ impl ProtocolParticipant for SignParticipant {
     {
         let config = ParticipantConfig::new(id, &other_participant_ids)?;
 
-        // The input must contain exactly one public key per particpant ID.
+        // The input must contain exactly one public key per participant ID.
         let public_key_pids = input
             .public_key_shares
             .iter()
@@ -261,10 +261,6 @@ impl ProtocolParticipant for SignParticipant {
 
     fn sid(&self) -> Identifier {
         self.sid
-    }
-
-    fn input(&self) -> &Self::Input {
-        &self.input
     }
 }
 
