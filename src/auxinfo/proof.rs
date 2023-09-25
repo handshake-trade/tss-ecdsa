@@ -31,6 +31,35 @@ pub(crate) struct AuxInfoProof {
     pifac: pifac::PiFacProof,
 }
 
+/// Common input and setup parameters known to both the prover and the verifier.
+#[derive(Clone)]
+pub(crate) struct CommonInput<'a> {
+    shared_context: &'a <AuxInfoParticipant as InnerProtocolParticipant>::Context,
+    sid: Identifier,
+    rho: [u8; 32],
+    setup_parameters: &'a VerifiedRingPedersen,
+    modulus: &'a BigNumber,
+}
+
+impl<'a> CommonInput<'a> {
+    /// Collect common parameters for proving or verifying a [`AuxInfoProof`]
+    pub(crate) fn new(
+        shared_context: &'a <AuxInfoParticipant as InnerProtocolParticipant>::Context,
+        sid: Identifier,
+        rho: [u8; 32],
+        verifier_setup_parameters: &'a VerifiedRingPedersen,
+        modulus: &'a BigNumber,
+    ) -> CommonInput<'a> {
+        Self {
+            shared_context,
+            sid,
+            rho,
+            setup_parameters: verifier_setup_parameters,
+            modulus,
+        }
+    }
+}
+
 impl AuxInfoProof {
     /// Generate a fresh transcript to be used in [`AuxInfoProof`].
     fn new_transcript() -> Transcript {
@@ -56,28 +85,34 @@ impl AuxInfoProof {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn prove<R: RngCore + CryptoRng>(
         rng: &mut R,
-        context: &<AuxInfoParticipant as InnerProtocolParticipant>::Context,
-        sid: Identifier,
-        rho: [u8; 32],
-        verifier_params: &VerifiedRingPedersen,
-        N: &BigNumber,
+        common_input: &CommonInput,
         p: &BigNumber,
         q: &BigNumber,
     ) -> Result<Self> {
         let mut transcript = Self::new_transcript();
-        Self::append_pimod_transcript(&mut transcript, context, sid, rho)?;
+        Self::append_pimod_transcript(
+            &mut transcript,
+            common_input.shared_context,
+            common_input.sid,
+            common_input.rho,
+        )?;
         let pimod = pimod::PiModProof::prove(
-            pimod::CommonInput::new(N),
+            pimod::CommonInput::new(common_input.modulus),
             pimod::ProverSecret::new(p, q),
-            context,
+            common_input.shared_context,
             &mut transcript,
             rng,
         )?;
-        Self::append_pifac_transcript(&mut transcript, context, sid, rho)?;
+        Self::append_pifac_transcript(
+            &mut transcript,
+            common_input.shared_context,
+            common_input.sid,
+            common_input.rho,
+        )?;
         let pifac = pifac::PiFacProof::prove(
-            pifac::CommonInput::new(verifier_params, N),
+            pifac::CommonInput::new(common_input.setup_parameters, common_input.modulus),
             pifac::ProverSecret::new(p, q),
-            context,
+            common_input.shared_context,
             &mut transcript,
             rng,
         )?;
@@ -91,22 +126,28 @@ impl AuxInfoProof {
     ///
     /// Note: The [`VerifiedRingPedersen`] argument **must be** provided by the
     /// verifier!
-    pub(crate) fn verify(
-        self,
-        context: &<AuxInfoParticipant as InnerProtocolParticipant>::Context,
-        sid: Identifier,
-        rho: [u8; 32],
-        verifier_params: &VerifiedRingPedersen,
-        N: &BigNumber,
-    ) -> Result<()> {
+    pub(crate) fn verify(self, common_input: &CommonInput) -> Result<()> {
         let mut transcript = Self::new_transcript();
-        Self::append_pimod_transcript(&mut transcript, context, sid, rho)?;
-        self.pimod
-            .verify(pimod::CommonInput::new(N), context, &mut transcript)?;
-        Self::append_pifac_transcript(&mut transcript, context, sid, rho)?;
+        Self::append_pimod_transcript(
+            &mut transcript,
+            common_input.shared_context,
+            common_input.sid,
+            common_input.rho,
+        )?;
+        self.pimod.verify(
+            pimod::CommonInput::new(common_input.modulus),
+            common_input.shared_context,
+            &mut transcript,
+        )?;
+        Self::append_pifac_transcript(
+            &mut transcript,
+            common_input.shared_context,
+            common_input.sid,
+            common_input.rho,
+        )?;
         self.pifac.verify(
-            pifac::CommonInput::new(verifier_params, N),
-            context,
+            pifac::CommonInput::new(common_input.setup_parameters, common_input.modulus),
+            common_input.shared_context,
             &mut transcript,
         )?;
         Ok(())
@@ -139,6 +180,117 @@ impl AuxInfoProof {
         transcript.append_message(b"PiFac ProofContext", &context.as_bytes()?);
         transcript.append_message(b"Session Id", &serialize!(&sid)?);
         transcript.append_message(b"rho", &rho);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{paillier::prime_gen, protocol::SharedContext, utils::testing::init_testing};
+    use rand::{rngs::StdRng, Rng, SeedableRng};
+
+    fn random_auxinfo_proof<R: RngCore + CryptoRng>(
+        rng: &mut R,
+        test_code: impl FnOnce(CommonInput, AuxInfoProof) -> Result<()>,
+    ) -> Result<()> {
+        let sid = Identifier::random(rng);
+        let rho = rng.gen();
+        let setup_params = VerifiedRingPedersen::gen(rng, &()).unwrap();
+        let (p, q) = prime_gen::get_prime_pair_from_pool_insecure(rng).unwrap();
+        let modulus = &p * &q;
+        let shared_context = SharedContext::random(rng);
+        let common_input = CommonInput::new(&shared_context, sid, rho, &setup_params, &modulus);
+        let proof = AuxInfoProof::prove(rng, &common_input, &p, &q).unwrap();
+        test_code(common_input, proof)
+    }
+
+    #[test]
+    fn auxinfo_proof_verifies() -> Result<()> {
+        let mut rng = init_testing();
+        let sid = Identifier::random(&mut rng);
+        let rho = rng.gen();
+        let setup_params = VerifiedRingPedersen::gen(&mut rng, &())?;
+        let (p, q) = prime_gen::get_prime_pair_from_pool_insecure(&mut rng).unwrap();
+        let modulus = &p * &q;
+        let shared_context = SharedContext::random(&mut rng);
+        let common_input = CommonInput::new(&shared_context, sid, rho, &setup_params, &modulus);
+        let proof = AuxInfoProof::prove(&mut rng, &common_input, &p, &q)?;
+        assert!(proof.verify(&common_input).is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn each_constituent_proof_must_be_valid() -> Result<()> {
+        let mut rng = init_testing();
+        let mut rng2 = StdRng::from_rng(&mut rng).unwrap();
+        let f = |input: CommonInput, proof: AuxInfoProof| {
+            let f1 = |input1: CommonInput, proof1: AuxInfoProof| {
+                let mix_one = AuxInfoProof {
+                    pifac: proof.pifac,
+                    pimod: proof1.pimod,
+                };
+                let mix_two = AuxInfoProof {
+                    pifac: proof1.pifac,
+                    pimod: proof.pimod,
+                };
+                assert!(mix_one.verify(&input).is_err());
+                assert!(mix_two.verify(&input1).is_err());
+                Ok(())
+            };
+            random_auxinfo_proof(&mut rng2, f1)?;
+            Ok(())
+        };
+        random_auxinfo_proof(&mut rng, f)?;
+        Ok(())
+    }
+
+    #[test]
+    fn modulus_factors_must_be_correct() -> Result<()> {
+        let mut rng = init_testing();
+        let sid = Identifier::random(&mut rng);
+        let rho = rng.gen();
+        let setup_params = VerifiedRingPedersen::gen(&mut rng, &())?;
+        let (p, q) = prime_gen::get_prime_pair_from_pool_insecure(&mut rng).unwrap();
+        let (p1, q1) = prime_gen::get_prime_pair_from_pool_insecure(&mut rng).unwrap();
+        let modulus = &p * &q;
+        let shared_context = &SharedContext::random(&mut rng);
+        let common_input = CommonInput::new(shared_context, sid, rho, &setup_params, &modulus);
+        match AuxInfoProof::prove(&mut rng, &common_input, &p1, &q1) {
+            Ok(proof) => assert!(proof.verify(&common_input).is_err()),
+            Err(_) => return Ok(()),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn context_must_be_correct() -> Result<()> {
+        let mut rng = init_testing();
+        let sid = Identifier::random(&mut rng);
+        let rho = rng.gen();
+        let setup_params = VerifiedRingPedersen::gen(&mut rng, &())?;
+        let (p, q) = prime_gen::get_prime_pair_from_pool_insecure(&mut rng).unwrap();
+        let modulus = &p * &q;
+        let shared_context = &SharedContext::random(&mut rng);
+        let bad_shared_context = &SharedContext::random(&mut rng);
+        let common_input = CommonInput {
+            shared_context,
+            sid,
+            rho,
+            setup_parameters: &setup_params,
+            modulus: &modulus,
+        };
+        let bad_common_input = CommonInput {
+            shared_context: bad_shared_context,
+            sid,
+            rho,
+            setup_parameters: &setup_params,
+            modulus: &modulus,
+        };
+        match AuxInfoProof::prove(&mut rng, &common_input, &p, &q) {
+            Ok(proof) => assert!(proof.verify(&bad_common_input).is_err()),
+            Err(_) => return Ok(()),
+        }
         Ok(())
     }
 }

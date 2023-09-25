@@ -13,7 +13,7 @@ use crate::{
     auxinfo::{
         auxinfo_commit::{Commitment, CommitmentScheme},
         info::{AuxInfoPrivate, AuxInfoPublic, AuxInfoWitnesses},
-        proof::AuxInfoProof,
+        proof::{AuxInfoProof, CommonInput},
         Output,
     },
     broadcast::participant::{BroadcastOutput, BroadcastParticipant, BroadcastTag},
@@ -493,23 +493,18 @@ impl AuxInfoParticipant {
 
         let witness = self.local_storage.retrieve::<storage::Witnesses>(self.id)?;
         let product = &witness.p * &witness.q;
-
         self.other_participant_ids
             .iter()
             .map(|&pid| {
                 // Grab the other participant's decommitment record from storage...
                 let verifier_decommit = self.local_storage.retrieve::<storage::Decommit>(pid)?;
+                let setup_params = verifier_decommit.clone().into_public();
+                let params = setup_params.params();
+                let shared_context = &self.retrieve_context();
                 // ... and use its setup parameters in the proof.
-                let proof = AuxInfoProof::prove(
-                    rng,
-                    &self.retrieve_context(),
-                    sid,
-                    global_rid,
-                    verifier_decommit.clone().into_public().params(),
-                    &product,
-                    &witness.p,
-                    &witness.q,
-                )?;
+                let common_input =
+                    CommonInput::new(shared_context, sid, global_rid, params, &product);
+                let proof = AuxInfoProof::prove(rng, &common_input, &witness.p, &witness.q)?;
                 Message::new(
                     MessageType::Auxinfo(AuxinfoMessageType::R3Proof),
                     sid,
@@ -552,15 +547,17 @@ impl AuxInfoParticipant {
         let my_public = self.local_storage.retrieve::<storage::Public>(self.id)?;
 
         let proof = AuxInfoProof::from_message(message)?;
-        // Verify the public parameters for the given participant. Note that
-        // this verification verifies _both_ the `𝚷[mod]` and `𝚷[fac]` proofs.
-        proof.verify(
-            &self.retrieve_context(),
+        let shared_context = &self.retrieve_context();
+        let common_input = CommonInput::new(
+            shared_context,
             message.id(),
             *global_rid,
             my_public.params(),
             auxinfo_pub.pk().modulus(),
-        )?;
+        );
+        // Verify the public parameters for the given participant. Note that
+        // this verification verifies _both_ the `𝚷[mod]` and `𝚷[fac]` proofs.
+        proof.verify(&common_input)?;
 
         self.local_storage
             .store::<storage::Public>(message.from(), auxinfo_pub);

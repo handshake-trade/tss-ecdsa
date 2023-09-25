@@ -493,7 +493,7 @@ impl ParticipantIdentifier {
 
 /// The `SharedContext` contains fixed known parameters across the entire
 /// protocol. It does not however contain the entire protocol context.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct SharedContext {
     sid: Identifier,
     participants: Vec<ParticipantIdentifier>,
@@ -517,6 +517,23 @@ impl ProofContext for SharedContext {
 }
 
 impl SharedContext {
+    /// This function should not be used outside of the tests.
+    #[cfg(test)]
+    pub fn random<R: RngCore + CryptoRng>(rng: &mut R) -> Self {
+        let sid = Identifier::random(rng);
+        let participant = ParticipantIdentifier::random(rng);
+        let participant2 = ParticipantIdentifier::random(rng);
+        let participants = vec![participant, participant2];
+        let generator = CurvePoint::GENERATOR;
+        let order = k256_order();
+        SharedContext {
+            sid,
+            participants,
+            generator,
+            order,
+        }
+    }
+
     pub(crate) fn collect<P: InnerProtocolParticipant>(p: &P) -> Self {
         let mut participants = p.all_participants();
         participants.sort();
