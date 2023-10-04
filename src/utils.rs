@@ -12,9 +12,10 @@ use k256::{
     elliptic_curve::{
         bigint::Encoding,
         group::{ff::PrimeField, GroupEncoding},
+        point::AffineCoordinates,
         AffinePoint, Curve,
     },
-    Scalar, Secp256k1,
+    EncodedPoint, FieldBytes, Scalar, Secp256k1,
 };
 use libpaillier::unknown_order::BigNumber;
 use merlin::Transcript;
@@ -33,7 +34,13 @@ pub(crate) const CRYPTOGRAPHIC_RETRY_MAX: usize = 500usize;
 /// private type, `Debug` should be manually implemented with the field of this
 /// type explicitly redacted!
 #[derive(Eq, PartialEq, Debug, Clone, Copy, Zeroize)]
-pub(crate) struct CurvePoint(pub k256::ProjectivePoint);
+pub(crate) struct CurvePoint(k256::ProjectivePoint);
+
+impl From<CurvePoint> for EncodedPoint {
+    fn from(value: CurvePoint) -> EncodedPoint {
+        value.0.to_affine().into()
+    }
+}
 
 impl AsRef<CurvePoint> for CurvePoint {
     fn as_ref(&self) -> &CurvePoint {
@@ -42,6 +49,15 @@ impl AsRef<CurvePoint> for CurvePoint {
 }
 
 impl CurvePoint {
+    pub fn x_affine(&self) -> FieldBytes {
+        self.0.to_affine().x()
+    }
+    #[cfg(test)]
+    pub(crate) fn random(rng: impl RngCore) -> Self {
+        use k256::{elliptic_curve::Group, ProjectivePoint};
+        let random_point = ProjectivePoint::random(rng);
+        CurvePoint(random_point)
+    }
     pub(crate) const GENERATOR: Self = CurvePoint(k256::ProjectivePoint::GENERATOR);
     /// The identity point, used to initialize the aggregation of a verification
     /// key

@@ -16,10 +16,7 @@ use crate::{
     protocol::SignatureShare,
     utils::{bn_to_scalar, CurvePoint, ParseBytes},
 };
-use k256::{
-    elliptic_curve::{point::AffineCoordinates, PrimeField},
-    Scalar,
-};
+use k256::{elliptic_curve::PrimeField, Scalar};
 use sha2::{Digest, Sha256};
 use std::fmt::Debug;
 use tracing::{error, info, instrument};
@@ -85,11 +82,11 @@ impl TryFrom<RecordPair> for PresignRecord {
         let mut Delta = private.Delta;
         for p in publics {
             delta += &p.delta;
-            Delta = CurvePoint(Delta.0 + p.Delta.0);
+            Delta = Delta + p.Delta;
         }
 
         let g = CurvePoint::GENERATOR;
-        if CurvePoint(g.0 * delta) != Delta {
+        if g.multiply_by_scalar(&delta) != Delta {
             error!("Could not create PresignRecord: mismatch between calculated private and public deltas");
             return Err(ProtocolError);
         }
@@ -98,7 +95,7 @@ impl TryFrom<RecordPair> for PresignRecord {
             error!("Could not invert delta as it is 0. Either you got profoundly unlucky or more likely there's a bug");
             InternalInvariantFailed
         })?;
-        let R = CurvePoint(private.Gamma.0 * delta_inv);
+        let R = private.Gamma.multiply_by_scalar(&delta_inv);
 
         Ok(PresignRecord {
             R,
@@ -121,7 +118,7 @@ impl PresignRecord {
     /// Compute the x-projection of the randomly-selected point `R` from the
     /// [`PresignRecord`].
     pub(crate) fn x_projection(&self) -> Result<Scalar> {
-        let x_projection = self.R.0.to_affine().x();
+        let x_projection = self.R.x_affine();
 
         // Note: I don't think this is a foolproof transformation. The `from_repr`
         // method expects a scalar in the range `[0, q)`, but there's no
@@ -277,10 +274,7 @@ impl PresignRecord {
 
 #[cfg(test)]
 mod tests {
-    use k256::{
-        elliptic_curve::{Field, Group},
-        ProjectivePoint, Scalar,
-    };
+    use k256::{elliptic_curve::Field, Scalar};
     use rand::{rngs::StdRng, CryptoRng, Rng, RngCore, SeedableRng};
 
     use crate::{
@@ -298,7 +292,7 @@ mod tests {
         /// Simulate creation of a random presign record. Do not use outside of
         /// testing.
         fn simulate(rng: &mut StdRng) -> PresignRecord {
-            let mask_point = CurvePoint(ProjectivePoint::random(StdRng::from_seed(rng.gen())));
+            let mask_point = CurvePoint::random(StdRng::from_seed(rng.gen()));
             let mask_share = Scalar::random(StdRng::from_seed(rng.gen()));
             let masked_key_share = Scalar::random(rng);
 
