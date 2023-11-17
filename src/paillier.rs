@@ -384,7 +384,7 @@ pub(crate) mod prime_gen {
     use rand::Rng;
     use rand::{CryptoRng, RngCore};
 
-    pub fn safe_prime_from_rng(size: usize, rng: &mut impl RngCore) -> BigNumber {
+    pub fn safe_prime_from_rng(size: usize, _rng: &mut impl RngCore) -> BigNumber {
         BigNumber::safe_prime(PRIME_BITS /* , rng */)
     }
 

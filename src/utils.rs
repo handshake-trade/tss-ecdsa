@@ -193,7 +193,8 @@ impl ParseBytes {
             );
             InternalError::InternalInvariantFailed
         })?;
-        Ok(usize::from_le_bytes(len_bytes))
+        let i: u64 = u64::from_le_bytes(len_bytes);
+        Ok(i as usize)
     }
 
     /// Take the rest of the bytes from the array.
