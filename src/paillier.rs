@@ -384,9 +384,13 @@ pub(crate) mod prime_gen {
     use rand::Rng;
     use rand::{CryptoRng, RngCore};
 
+    pub fn safe_prime_from_rng(size: usize, rng: &mut impl RngCore) -> BigNumber {
+        BigNumber::safe_prime(PRIME_BITS /* , rng */)
+    }
+
     /// Sample a safe prime with length `PRIME_BITS` at random.
     pub(crate) fn get_random_safe_prime<R: RngCore + CryptoRng>(rng: &mut R) -> BigNumber {
-        BigNumber::safe_prime_from_rng(PRIME_BITS, rng)
+        safe_prime_from_rng(PRIME_BITS, rng)
     }
 
     #[cfg(test)]
@@ -669,8 +673,8 @@ mod test {
         let rng = &mut init_testing();
 
         // Generate too-small primes
-        let p = BigNumber::safe_prime_from_rng(PRIME_BITS / 2, rng);
-        let q = BigNumber::safe_prime_from_rng(PRIME_BITS / 2, rng);
+        let p = prime_gen::safe_prime_from_rng(PRIME_BITS / 2, rng);
+        let q = prime_gen::safe_prime_from_rng(PRIME_BITS / 2, rng);
 
         // Manually create small DK
         let small_decryption_key =
@@ -680,8 +684,8 @@ mod test {
         assert!(DecryptionKey::try_from_bytes(&bytes).is_err());
 
         // Generate too-large primes (this is sometimes slow)
-        let p = BigNumber::safe_prime_from_rng(PRIME_BITS + 1, rng);
-        let q = BigNumber::safe_prime_from_rng(PRIME_BITS + 1, rng);
+        let p = prime_gen::safe_prime_from_rng(PRIME_BITS + 1, rng);
+        let q = prime_gen::safe_prime_from_rng(PRIME_BITS + 1, rng);
         let large_decryption_key =
             DecryptionKey(libpaillier::DecryptionKey::with_primes(&p, &q).unwrap());
         assert!(large_decryption_key.modulus().bit_length() > 2 * PRIME_BITS);

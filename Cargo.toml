@@ -24,7 +24,7 @@ generic-array = "0.14"
 hex = "0.4"
 k256 = { version = "0.13", features = ["arithmetic", "sha256", "ecdsa", "serde"] }
 lazy_static = "1"
-libpaillier = { version = "0.5", default-features = false, features = ["gmp"] }
+libpaillier = { version = "0.5", default-features = false, features = ["openssl"] }
 merlin = "3"
 num-bigint = "0.4"
 rand = "0.8"
